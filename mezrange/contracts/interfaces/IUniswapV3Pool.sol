@@ -13,9 +13,8 @@ interface IUniswapV3Pool {
         uint16 observationIndex,
         uint16 observationCardinality,
         uint16 observationCardinalityNext,
-        uint8 feeProtocol,
-        bool unlocked
-    );
+        uint8 feeProtocol
+    ); // NOTE: Mezo DEX omits the `bool unlocked` field present in standard Uniswap V3
     function observe(uint32[] calldata secondsAgos) external view returns (
         int56[] memory tickCumulatives,
         uint160[] memory secondsPerLiquidityCumulativeX128s

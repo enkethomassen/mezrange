@@ -44,9 +44,9 @@ contract MockUniswapV3Pool is IUniswapV3Pool {
     function slot0() external view override returns (
         uint160 _sqrtPriceX96,
         int24   _tick,
-        uint16, uint16, uint16, uint8, bool
+        uint16, uint16, uint16, uint8
     ) {
-        return (sqrtPriceX96, currentTick, 0, 1, 1, 0, true);
+        return (sqrtPriceX96, currentTick, 0, 1, 1, 0);
     }
 
     function observe(uint32[] calldata secondsAgos)

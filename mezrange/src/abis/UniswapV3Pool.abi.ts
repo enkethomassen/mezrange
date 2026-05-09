@@ -14,7 +14,7 @@ export const UNISWAP_V3_POOL_ABI = [
       { name: 'observationCardinality',       type: 'uint16'  },
       { name: 'observationCardinalityNext',   type: 'uint16'  },
       { name: 'feeProtocol',                  type: 'uint8'   },
-      { name: 'unlocked',                     type: 'bool'    },
+      // NOTE: Mezo DEX omits `bool unlocked` — do not add it here
     ],
   },
 ] as const;

@@ -149,7 +149,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         token0.forceApprove(address(positionManager), amount0);
         token1.forceApprove(address(positionManager), amount1);
 
-        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        (uint160 sqrtPriceX96,,,,,) = pool.slot0();
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
 
@@ -212,7 +212,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         if (!positionActive) revert NoActivePosition();
         if (liquidity == 0) revert ZeroLiquidity();
 
-        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        (uint160 sqrtPriceX96,,,,,) = pool.slot0();
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
         (uint256 est0, uint256 est1) = LiquidityAmounts.getAmountsForLiquidity(
@@ -337,7 +337,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
 
     function shouldRebalance() external view returns (bool) {
         if (!positionActive) return false;
-        (, int24 currentTick,,,,,) = pool.slot0();
+        (, int24 currentTick,,,,) = pool.slot0();
         return currentTick < currentTickLower || currentTick >= currentTickUpper;
     }
 
@@ -350,7 +350,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         uint256 pos0 = 0;
         uint256 pos1 = 0;
         if (positionActive) {
-            (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+            (uint160 sqrtPriceX96,,,,,) = pool.slot0();
             uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
             uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
             (,,,,,,, uint128 liquidity,, ,uint128 tokensOwed0, uint128 tokensOwed1) =
@@ -436,7 +436,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         } catch {
             // Fallback to spot tick for brand-new pools without TWAP history.
             // Admin: set minPoolAgeSecs and avoid deploying on pools younger than this value.
-            (, int24 tick,,,,,) = pool.slot0();
+            (, int24 tick,,,,) = pool.slot0();
             return tick;
         }
     }
@@ -446,7 +446,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
     ///         Converges within MAX_RATIO_ITERS iterations (default 4) or a 1% balance tolerance.
     ///         Replaces the previous hard /2 halving heuristic.
     function _rebalanceTokenRatio(int24 tickLower, int24 tickUpper) internal {
-        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        (uint160 sqrtPriceX96,,,,,) = pool.slot0();
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
 
@@ -606,7 +606,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
             token0.forceApprove(address(positionManager), bal0);
             token1.forceApprove(address(positionManager), bal1);
 
-            (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+            (uint160 sqrtPriceX96,,,,,) = pool.slot0();
             uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(newTickLower);
             uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(newTickUpper);
 
@@ -648,7 +648,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     function _decreaseLiquidity(uint128 liquidity) internal {
-        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        (uint160 sqrtPriceX96,,,,,) = pool.slot0();
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
         (uint256 est0, uint256 est1) = LiquidityAmounts.getAmountsForLiquidity(

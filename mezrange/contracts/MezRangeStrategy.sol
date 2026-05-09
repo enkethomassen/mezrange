@@ -145,7 +145,7 @@ contract MezRangeStrategy is AccessControl, ReentrancyGuard, Pausable, IERC721Re
         token0.forceApprove(address(positionManager), amount0);
         token1.forceApprove(address(positionManager), amount1);
 
-        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        (uint160 sqrtPriceX96,,,,,) = pool.slot0();
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
 
@@ -208,7 +208,7 @@ contract MezRangeStrategy is AccessControl, ReentrancyGuard, Pausable, IERC721Re
         if (!positionActive) revert NoActivePosition();
         if (liquidity == 0) revert ZeroLiquidity();
 
-        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        (uint160 sqrtPriceX96,,,,,) = pool.slot0();
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
         (uint256 est0, uint256 est1) = LiquidityAmounts.getAmountsForLiquidity(
@@ -320,7 +320,7 @@ contract MezRangeStrategy is AccessControl, ReentrancyGuard, Pausable, IERC721Re
 
     function shouldRebalance() external view returns (bool) {
         if (!positionActive) return false;
-        (, int24 currentTick,,,,,) = pool.slot0();
+        (, int24 currentTick,,,,) = pool.slot0();
         return currentTick < currentTickLower || currentTick >= currentTickUpper;
     }
 
@@ -333,7 +333,7 @@ contract MezRangeStrategy is AccessControl, ReentrancyGuard, Pausable, IERC721Re
         uint256 pos0 = 0;
         uint256 pos1 = 0;
         if (positionActive) {
-            (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+            (uint160 sqrtPriceX96,,,,,) = pool.slot0();
             uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
             uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
             (,,,,,,, uint128 liquidity,, ,uint128 tokensOwed0, uint128 tokensOwed1) =
@@ -433,7 +433,7 @@ contract MezRangeStrategy is AccessControl, ReentrancyGuard, Pausable, IERC721Re
         } catch {
             // Pool passed age check but TWAP window still not fully populated;
             // fall back to spot tick as a last resort.
-            (, int24 tick,,,,,) = pool.slot0();
+            (, int24 tick,,,,) = pool.slot0();
             return tick;
         }
     }
@@ -443,7 +443,7 @@ contract MezRangeStrategy is AccessControl, ReentrancyGuard, Pausable, IERC721Re
     ///         Converges within MAX_RATIO_ITERS iterations (default 4) or a 1% balance tolerance.
     ///         Replaces the previous hard /2 halving heuristic.
     function _rebalanceTokenRatio(int24 tickLower, int24 tickUpper) internal {
-        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        (uint160 sqrtPriceX96,,,,,) = pool.slot0();
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
 
@@ -579,7 +579,7 @@ contract MezRangeStrategy is AccessControl, ReentrancyGuard, Pausable, IERC721Re
             token0.forceApprove(address(positionManager), bal0);
             token1.forceApprove(address(positionManager), bal1);
 
-            (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+            (uint160 sqrtPriceX96,,,,,) = pool.slot0();
             uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(newTickLower);
             uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(newTickUpper);
 
@@ -619,7 +619,7 @@ contract MezRangeStrategy is AccessControl, ReentrancyGuard, Pausable, IERC721Re
     }
 
     function _decreaseLiquidity(uint128 liquidity) internal {
-        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        (uint160 sqrtPriceX96,,,,,) = pool.slot0();
         uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
         uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
         (uint256 est0, uint256 est1) = LiquidityAmounts.getAmountsForLiquidity(
