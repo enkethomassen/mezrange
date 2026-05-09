@@ -1,0 +1,569 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import "./interfaces/INonfungiblePositionManager.sol";
+import "./interfaces/IUniswapV3Pool.sol";
+import "./interfaces/IUniswapV3SwapRouter.sol";
+import "./libraries/TickMath.sol";
+import "./libraries/LiquidityAmounts.sol";
+
+/// @title MezRangeStrategy
+/// @notice Manages concentrated liquidity positions on Uniswap V3-compatible DEX for Mezo.
+///         Handles adding/removing liquidity, fee collection, and auto-rebalancing.
+///         Implements IERC721Receiver to safely hold Uniswap V3 position NFTs.
+contract MezRangeStrategy is AccessControl, ReentrancyGuard, Pausable, IERC721Receiver {
+    using SafeERC20 for IERC20;
+
+    // ── Roles ────────────────────────────────────────────────────────────────
+    bytes32 public constant KEEPER_ROLE    = keccak256("KEEPER_ROLE");
+    bytes32 public constant VAULT_ROLE     = keccak256("VAULT_ROLE");
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
+
+    // ── Strategy types ───────────────────────────────────────────────────────
+    enum StrategyType { TIGHT, MEDIUM, WIDE }
+
+    // Width in basis points for each strategy
+    // TIGHT: ±3% => 600 bps total range
+    // MEDIUM: ±10% => 2000 bps total range
+    // WIDE: ±30% => 6000 bps total range
+    uint24[3] public STRATEGY_WIDTHS = [600, 2000, 6000];
+
+    // ── State ────────────────────────────────────────────────────────────────
+    INonfungiblePositionManager public immutable positionManager;
+    IUniswapV3Pool              public immutable pool;
+    IUniswapV3SwapRouter        public immutable swapRouter;
+    IERC20                      public immutable token0;
+    IERC20                      public immutable token1;
+    uint24                      public immutable fee;
+    int24                       public immutable tickSpacing;
+
+    uint256 public positionTokenId;
+    bool    public positionActive;
+    int24   public currentTickLower;
+    int24   public currentTickUpper;
+    StrategyType public strategy;
+
+    uint256 public totalFeesCollected0;
+    uint256 public totalFeesCollected1;
+    uint256 public rebalanceCount;
+    uint256 public lastRebalanceTimestamp;
+
+    // Slippage tolerance in basis points (default 50 = 0.5%)
+    uint256 public slippageBps = 50;
+
+    // TWAP window in seconds
+    uint32  public twapSeconds = 300;
+
+    // ── Events ───────────────────────────────────────────────────────────────
+    event PositionOpened(uint256 indexed tokenId, int24 tickLower, int24 tickUpper, uint128 liquidity);
+    event PositionClosed(uint256 indexed tokenId, uint256 amount0, uint256 amount1);
+    event FeesCollected(uint256 amount0, uint256 amount1);
+    event Rebalanced(int24 oldLower, int24 oldUpper, int24 newLower, int24 newUpper, uint256 feesCollected0, uint256 feesCollected1);
+    event StrategyChanged(StrategyType newStrategy);
+    event SlippageUpdated(uint256 newSlippageBps);
+    event TokensSwappedForRebalance(uint256 amountIn, uint256 amountOut, bool zeroForOne);
+
+    // ── Errors ───────────────────────────────────────────────────────────────
+    error NotInRange();
+    error PositionAlreadyActive();
+    error NoActivePosition();
+    error SlippageExceeded();
+    error ZeroLiquidity();
+
+    constructor(
+        address _positionManager,
+        address _pool,
+        address _swapRouter,
+        StrategyType _strategy,
+        address _admin
+    ) {
+        positionManager = INonfungiblePositionManager(_positionManager);
+        pool = IUniswapV3Pool(_pool);
+        swapRouter = IUniswapV3SwapRouter(_swapRouter);
+        token0 = IERC20(pool.token0());
+        token1 = IERC20(pool.token1());
+        fee = pool.fee();
+        tickSpacing = TickMath.tickSpacingForFee(fee);
+        strategy = _strategy;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
+        _grantRole(EMERGENCY_ROLE, _admin);
+    }
+
+    // ── IERC721Receiver ──────────────────────────────────────────────────────
+
+    /// @notice Required to safely receive Uniswap V3 position NFTs via safeTransferFrom
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external pure override returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+
+    // ── External: Vault-callable ─────────────────────────────────────────────
+
+    /// @notice Open a new liquidity position at the current optimal range.
+    ///         If only token0 is provided, automatically swaps ~50% to token1
+    ///         so that both tokens are deployed into the concentrated position.
+    function addLiquidity(uint256 amount0, uint256 amount1)
+        external
+        onlyRole(VAULT_ROLE)
+        nonReentrant
+        whenNotPaused
+        returns (uint128 liquidity)
+    {
+        (int24 tickLower, int24 tickUpper) = _calcOptimalRange();
+
+        token0.safeTransferFrom(msg.sender, address(this), amount0);
+        if (amount1 > 0) token1.safeTransferFrom(msg.sender, address(this), amount1);
+
+        // If only token0 was supplied, swap ~50% to token1 for balanced deposit
+        if (amount1 == 0 && amount0 > 0) {
+            uint256 swapAmt = amount0 / 2;
+            amount1 = _swapToken0ForToken1(swapAmt);
+            amount0 = token0.balanceOf(address(this));
+        }
+
+        token0.forceApprove(address(positionManager), amount0);
+        token1.forceApprove(address(positionManager), amount1);
+
+        uint256 amount0Min = amount0 * (10000 - slippageBps) / 10000;
+        uint256 amount1Min = amount1 * (10000 - slippageBps) / 10000;
+
+        if (!positionActive) {
+            // Mint new position
+            (uint256 tokenId, uint128 liq,,) = positionManager.mint(
+                INonfungiblePositionManager.MintParams({
+                    token0: address(token0),
+                    token1: address(token1),
+                    fee: fee,
+                    tickLower: tickLower,
+                    tickUpper: tickUpper,
+                    amount0Desired: amount0,
+                    amount1Desired: amount1,
+                    amount0Min: amount0Min,
+                    amount1Min: amount1Min,
+                    recipient: address(this),
+                    deadline: block.timestamp + 60
+                })
+            );
+            positionTokenId = tokenId;
+            positionActive = true;
+            currentTickLower = tickLower;
+            currentTickUpper = tickUpper;
+            liquidity = liq;
+            emit PositionOpened(tokenId, tickLower, tickUpper, liq);
+        } else {
+            // Increase existing position
+            (uint128 liq,,) = positionManager.increaseLiquidity(
+                INonfungiblePositionManager.IncreaseLiquidityParams({
+                    tokenId: positionTokenId,
+                    amount0Desired: amount0,
+                    amount1Desired: amount1,
+                    amount0Min: amount0Min,
+                    amount1Min: amount1Min,
+                    deadline: block.timestamp + 60
+                })
+            );
+            liquidity = liq;
+        }
+    }
+
+    /// @notice Remove liquidity proportionally and return tokens to vault
+    function removeLiquidity(uint128 liquidity, address recipient)
+        external
+        onlyRole(VAULT_ROLE)
+        nonReentrant
+        whenNotPaused
+        returns (uint256 amount0, uint256 amount1)
+    {
+        if (!positionActive) revert NoActivePosition();
+        if (liquidity == 0) revert ZeroLiquidity();
+
+        uint256 amount0Min = 0;
+        uint256 amount1Min = 0;
+
+        // Apply slippage to removeLiquidity as well
+        // Get current reserves for the given liquidity share
+        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
+        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
+        (uint256 est0, uint256 est1) = LiquidityAmounts.getAmountsForLiquidity(
+            sqrtPriceX96, sqrtRatioAX96, sqrtRatioBX96, liquidity
+        );
+        amount0Min = est0 * (10000 - slippageBps) / 10000;
+        amount1Min = est1 * (10000 - slippageBps) / 10000;
+
+        positionManager.decreaseLiquidity(
+            INonfungiblePositionManager.DecreaseLiquidityParams({
+                tokenId: positionTokenId,
+                liquidity: liquidity,
+                amount0Min: amount0Min,
+                amount1Min: amount1Min,
+                deadline: block.timestamp + 60
+            })
+        );
+
+        (uint256 collected0, uint256 collected1) = positionManager.collect(
+            INonfungiblePositionManager.CollectParams({
+                tokenId: positionTokenId,
+                recipient: recipient,
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            })
+        );
+        return (collected0, collected1);
+    }
+
+    /// @notice Collect accrued fees and compound back into position
+    function collectAndCompound()
+        external
+        onlyRole(KEEPER_ROLE)
+        nonReentrant
+        whenNotPaused
+        returns (uint256 fees0, uint256 fees1)
+    {
+        if (!positionActive) revert NoActivePosition();
+
+        (fees0, fees1) = positionManager.collect(
+            INonfungiblePositionManager.CollectParams({
+                tokenId: positionTokenId,
+                recipient: address(this),
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            })
+        );
+
+        totalFeesCollected0 += fees0;
+        totalFeesCollected1 += fees1;
+        emit FeesCollected(fees0, fees1);
+
+        // Compound: re-add collected fees into position
+        if (fees0 > 0 || fees1 > 0) {
+            token0.forceApprove(address(positionManager), fees0);
+            token1.forceApprove(address(positionManager), fees1);
+            positionManager.increaseLiquidity(
+                INonfungiblePositionManager.IncreaseLiquidityParams({
+                    tokenId: positionTokenId,
+                    amount0Desired: fees0,
+                    amount1Desired: fees1,
+                    amount0Min: 0,
+                    amount1Min: 0,
+                    deadline: block.timestamp + 60
+                })
+            );
+        }
+    }
+
+    /// @notice Rebalance position into a new optimal range around current TWAP price.
+    ///         Applies slippage protection on the new mint using TWAP-derived expected amounts.
+    ///         If the token ratio is imbalanced after closing, swaps to achieve ~50/50 before re-minting.
+    /// @dev Called by keeper when price exits range, or proactively
+    function rebalance()
+        external
+        onlyRole(KEEPER_ROLE)
+        nonReentrant
+        whenNotPaused
+    {
+        if (!positionActive) revert NoActivePosition();
+
+        int24 oldLower = currentTickLower;
+        int24 oldUpper = currentTickUpper;
+
+        // 1. Collect fees before removing
+        (uint256 fees0, uint256 fees1) = positionManager.collect(
+            INonfungiblePositionManager.CollectParams({
+                tokenId: positionTokenId,
+                recipient: address(this),
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            })
+        );
+        totalFeesCollected0 += fees0;
+        totalFeesCollected1 += fees1;
+
+        // 2. Remove all liquidity
+        (,,,,,,, uint128 currentLiquidity,,,, ) = positionManager.positions(positionTokenId);
+        if (currentLiquidity > 0) {
+            positionManager.decreaseLiquidity(
+                INonfungiblePositionManager.DecreaseLiquidityParams({
+                    tokenId: positionTokenId,
+                    liquidity: currentLiquidity,
+                    amount0Min: 0,
+                    amount1Min: 0,
+                    deadline: block.timestamp + 60
+                })
+            );
+            positionManager.collect(
+                INonfungiblePositionManager.CollectParams({
+                    tokenId: positionTokenId,
+                    recipient: address(this),
+                    amount0Max: type(uint128).max,
+                    amount1Max: type(uint128).max
+                })
+            );
+        }
+
+        // 3. Burn old position NFT
+        positionManager.burn(positionTokenId);
+        positionActive = false;
+
+        // 4. Calculate new optimal range using TWAP
+        (int24 newTickLower, int24 newTickUpper) = _calcOptimalRange();
+
+        // 5. Delta-neutral rebalancing: swap tokens to achieve optimal ratio for new range
+        _rebalanceTokenRatio(newTickLower, newTickUpper);
+
+        // 6. Re-add liquidity at new range with slippage protection
+        uint256 bal0 = token0.balanceOf(address(this));
+        uint256 bal1 = token1.balanceOf(address(this));
+
+        if (bal0 > 0 || bal1 > 0) {
+            token0.forceApprove(address(positionManager), bal0);
+            token1.forceApprove(address(positionManager), bal1);
+
+            // Compute expected amounts for slippage floor
+            (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+            uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(newTickLower);
+            uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(newTickUpper);
+
+            uint128 estLiquidity = LiquidityAmounts.getLiquidityForAmounts(
+                sqrtPriceX96, sqrtRatioAX96, sqrtRatioBX96, bal0, bal1
+            );
+            (uint256 est0, uint256 est1) = LiquidityAmounts.getAmountsForLiquidity(
+                sqrtPriceX96, sqrtRatioAX96, sqrtRatioBX96, estLiquidity
+            );
+
+            uint256 amount0Min = est0 * (10000 - slippageBps) / 10000;
+            uint256 amount1Min = est1 * (10000 - slippageBps) / 10000;
+
+            (uint256 newTokenId,,,) = positionManager.mint(
+                INonfungiblePositionManager.MintParams({
+                    token0: address(token0),
+                    token1: address(token1),
+                    fee: fee,
+                    tickLower: newTickLower,
+                    tickUpper: newTickUpper,
+                    amount0Desired: bal0,
+                    amount1Desired: bal1,
+                    amount0Min: amount0Min,
+                    amount1Min: amount1Min,
+                    recipient: address(this),
+                    deadline: block.timestamp + 60
+                })
+            );
+
+            positionTokenId = newTokenId;
+            positionActive = true;
+            currentTickLower = newTickLower;
+            currentTickUpper = newTickUpper;
+        }
+
+        rebalanceCount++;
+        lastRebalanceTimestamp = block.timestamp;
+
+        emit Rebalanced(oldLower, oldUpper, newTickLower, newTickUpper, fees0, fees1);
+    }
+
+    // ── Keeper trigger check ─────────────────────────────────────────────────
+
+    /// @notice Returns true if current price is outside the active range (trigger for keeper)
+    function shouldRebalance() external view returns (bool) {
+        if (!positionActive) return false;
+        (, int24 currentTick,,,,,) = pool.slot0();
+        return currentTick < currentTickLower || currentTick >= currentTickUpper;
+    }
+
+    // ── View: total value accounting ─────────────────────────────────────────
+
+    /// @notice Returns the total token0-equivalent value held by the strategy.
+    ///         Includes: idle token0 balance, idle token1 balance (converted via TWAP),
+    ///         and the token0+token1 currently deployed in the LP position.
+    ///         Used by MezRangeVault.totalAssets() for accurate share pricing.
+    function totalValue() external view returns (uint256 value0) {
+        // Idle balances
+        uint256 idle0 = token0.balanceOf(address(this));
+        uint256 idle1 = token1.balanceOf(address(this));
+
+        // In-position amounts
+        uint256 pos0 = 0;
+        uint256 pos1 = 0;
+        if (positionActive) {
+            (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+            uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
+            uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
+            (,,,,,,, uint128 liquidity,, ,uint128 tokensOwed0, uint128 tokensOwed1) =
+                positionManager.positions(positionTokenId);
+            (pos0, pos1) = LiquidityAmounts.getAmountsForLiquidity(
+                sqrtPriceX96, sqrtRatioAX96, sqrtRatioBX96, liquidity
+            );
+            pos0 += tokensOwed0;
+            pos1 += tokensOwed1;
+        }
+
+        uint256 total1 = idle1 + pos1;
+
+        // Convert token1 to token0 equivalent using TWAP price
+        if (total1 > 0) {
+            int24 twapTick = _getTwapTick();
+            // price = 1.0001^tick (token1 per token0)
+            // We approximate: token0_equiv = token1 / price
+            // Using sqrtPrice at twapTick for the conversion
+            uint160 sqrtPriceTwap = TickMath.getSqrtRatioAtTick(twapTick);
+            // price_X96 = (sqrtPrice)^2 / 2^192
+            // token0_equiv = token1 * 2^192 / sqrtPrice^2
+            // To avoid overflow, compute as: token1 << 96 / sqrtPrice * (1 << 96) / sqrtPrice
+            if (sqrtPriceTwap > 0) {
+                uint256 token1InToken0 = (total1 << 96) / sqrtPriceTwap;
+                token1InToken0 = (token1InToken0 << 96) / sqrtPriceTwap;
+                value0 = idle0 + pos0 + token1InToken0;
+            } else {
+                value0 = idle0 + pos0;
+            }
+        } else {
+            value0 = idle0 + pos0;
+        }
+    }
+
+    // ── Admin functions ──────────────────────────────────────────────────────
+
+    function setStrategy(StrategyType _strategy) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        strategy = _strategy;
+        emit StrategyChanged(_strategy);
+    }
+
+    function setSlippage(uint256 _bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_bps <= 500, "Max 5% slippage");
+        slippageBps = _bps;
+        emit SlippageUpdated(_bps);
+    }
+
+    function setTwapSeconds(uint32 _seconds) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_seconds >= 60, "Min 60s TWAP");
+        twapSeconds = _seconds;
+    }
+
+    function pause()   external onlyRole(EMERGENCY_ROLE) { _pause(); }
+    function unpause() external onlyRole(EMERGENCY_ROLE) { _unpause(); }
+
+    /// @notice Emergency token rescue
+    function rescueTokens(address token, address to, uint256 amount)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        whenPaused
+    {
+        IERC20(token).safeTransfer(to, amount);
+    }
+
+    // ── Internal ─────────────────────────────────────────────────────────────
+
+    /// @notice Get TWAP-adjusted tick and calculate optimal range
+    function _calcOptimalRange() internal view returns (int24 tickLower, int24 tickUpper) {
+        int24 twapTick = _getTwapTick();
+        uint24 widthBps = STRATEGY_WIDTHS[uint256(strategy)];
+        (tickLower, tickUpper) = TickMath.calcRange(twapTick, widthBps, tickSpacing);
+    }
+
+    /// @notice Compute TWAP tick over `twapSeconds` window
+    function _getTwapTick() internal view returns (int24) {
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = twapSeconds;
+        secondsAgos[1] = 0;
+
+        try pool.observe(secondsAgos) returns (int56[] memory cumulatives, uint160[] memory) {
+            int56 tickDelta = cumulatives[1] - cumulatives[0];
+            return int24(tickDelta / int56(int32(twapSeconds)));
+        } catch {
+            // Fallback to spot tick if TWAP unavailable (new pool)
+            (, int24 tick,,,,,) = pool.slot0();
+            return tick;
+        }
+    }
+
+    /// @notice Delta-neutral rebalancing: swap tokens to match the optimal ratio
+    ///         required by the new tick range, minimizing idle token waste.
+    function _rebalanceTokenRatio(int24 tickLower, int24 tickUpper) internal {
+        uint256 bal0 = token0.balanceOf(address(this));
+        uint256 bal1 = token1.balanceOf(address(this));
+        if (bal0 == 0 && bal1 == 0) return;
+
+        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(tickLower);
+        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(tickUpper);
+
+        // Compute how much liquidity each token alone could provide
+        uint128 liq0 = LiquidityAmounts.getLiquidityForAmount0(sqrtPriceX96, sqrtRatioBX96, bal0);
+        uint128 liq1 = LiquidityAmounts.getLiquidityForAmount1(sqrtRatioAX96, sqrtPriceX96, bal1);
+
+        if (liq0 == 0 && liq1 == 0) return;
+
+        if (liq0 > liq1) {
+            // We have excess token0; swap some to token1
+            uint128 targetLiq = liq1;
+            (uint256 need0,) = LiquidityAmounts.getAmountsForLiquidity(
+                sqrtPriceX96, sqrtRatioAX96, sqrtRatioBX96, targetLiq
+            );
+            if (bal0 > need0) {
+                uint256 swapAmt = bal0 - need0;
+                _swapToken0ForToken1(swapAmt / 2); // halve to avoid overshooting
+            }
+        } else {
+            // We have excess token1; swap some to token0
+            uint128 targetLiq = liq0;
+            (, uint256 need1) = LiquidityAmounts.getAmountsForLiquidity(
+                sqrtPriceX96, sqrtRatioAX96, sqrtRatioBX96, targetLiq
+            );
+            if (bal1 > need1) {
+                uint256 swapAmt = bal1 - need1;
+                _swapToken1ForToken0(swapAmt / 2);
+            }
+        }
+    }
+
+    /// @notice Swap token0 → token1 via the pool's swap router
+    function _swapToken0ForToken1(uint256 amountIn) internal returns (uint256 amountOut) {
+        if (amountIn == 0) return 0;
+        token0.forceApprove(address(swapRouter), amountIn);
+        uint256 amountOutMin = 0; // slippage handled at position level
+        amountOut = swapRouter.exactInputSingle(
+            IUniswapV3SwapRouter.ExactInputSingleParams({
+                tokenIn: address(token0),
+                tokenOut: address(token1),
+                fee: fee,
+                recipient: address(this),
+                deadline: block.timestamp + 60,
+                amountIn: amountIn,
+                amountOutMinimum: amountOutMin,
+                sqrtPriceLimitX96: 0
+            })
+        );
+        emit TokensSwappedForRebalance(amountIn, amountOut, true);
+    }
+
+    /// @notice Swap token1 → token0 via the pool's swap router
+    function _swapToken1ForToken0(uint256 amountIn) internal returns (uint256 amountOut) {
+        if (amountIn == 0) return 0;
+        token1.forceApprove(address(swapRouter), amountIn);
+        amountOut = swapRouter.exactInputSingle(
+            IUniswapV3SwapRouter.ExactInputSingleParams({
+                tokenIn: address(token1),
+                tokenOut: address(token0),
+                fee: fee,
+                recipient: address(this),
+                deadline: block.timestamp + 60,
+                amountIn: amountIn,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            })
+        );
+        emit TokensSwappedForRebalance(amountIn, amountOut, false);
+    }
+}

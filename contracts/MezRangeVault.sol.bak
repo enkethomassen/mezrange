@@ -1,0 +1,365 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "./MezRangeStrategy.sol";
+
+/// @title MezRangeVault
+/// @notice Fully ERC-4626 compliant vault for automated LP management on Mezo DEX.
+///         Users deposit token0; vault manages a Uniswap V3-style LP position,
+///         auto-rebalances when price drifts out of range, and compounds fees.
+///         Share tokens represent proportional ownership of the vault's assets.
+///
+/// @dev totalAssets() is derived from strategy.totalValue(), which sums:
+///      - idle token0 in strategy
+///      - idle token1 in strategy (converted to token0 via TWAP)
+///      - token0+token1 in the active LP position (converted to token0 via TWAP)
+///      This correctly reflects all value under management and prevents share pricing bugs.
+contract MezRangeVault is ERC20, IERC4626, AccessControl, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    // ── Roles ────────────────────────────────────────────────────────────────
+    bytes32 public constant KEEPER_ROLE    = keccak256("KEEPER_ROLE");
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
+
+    // ── Config ───────────────────────────────────────────────────────────────
+    IERC20           public immutable override asset;  // deposit token (token0)
+    MezRangeStrategy public immutable strategy;
+
+    address public treasury;
+    uint256 public performanceFeeBps = 1000;  // 10% of earned fees
+    uint256 public managementFeeBps  = 100;   // 1% annual management fee
+    uint256 public lastFeeTimestamp;
+
+    // ── Events ───────────────────────────────────────────────────────────────
+    // ERC-4626 standard events (Deposit & Withdraw) are inherited from IERC4626
+    event FeesCharged(uint256 performanceFee, uint256 managementFee);
+    event TreasuryUpdated(address newTreasury);
+    event PerformanceFeeUpdated(uint256 newBps);
+
+    // ── Errors ───────────────────────────────────────────────────────────────
+    error ZeroAmount();
+    error InsufficientShares();
+    error MaxSlippageExceeded();
+    error ExceedsMaxDeposit();
+
+    // ── ERC-4626 constants ────────────────────────────────────────────────────
+    uint256 public constant MAX_DEPOSIT_PER_TX = type(uint256).max; // no cap by default
+
+    constructor(
+        address _asset,
+        address _strategy,
+        address _treasury,
+        address _admin,
+        string memory _name,
+        string memory _symbol
+    ) ERC20(_name, _symbol) {
+        asset = IERC20(_asset);
+        strategy = MezRangeStrategy(_strategy);
+        treasury = _treasury;
+        lastFeeTimestamp = block.timestamp;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
+        _grantRole(EMERGENCY_ROLE, _admin);
+    }
+
+    // ── ERC-4626: Core View Functions ────────────────────────────────────────
+
+    /// @notice Returns total assets managed by the vault.
+    ///         Queries strategy.totalValue() which sums all token0-equivalent value
+    ///         including in-position liquidity and idle balances. Accurate share pricing.
+    function totalAssets() public view override returns (uint256) {
+        // Any assets sitting idle in the vault itself (before being forwarded to strategy)
+        uint256 idleInVault = asset.balanceOf(address(this));
+        // All value under management in the strategy (deployed + idle, token0-equivalent)
+        uint256 strategyValue = strategy.totalValue();
+        return idleInVault + strategyValue;
+    }
+
+    /// @inheritdoc IERC4626
+    function convertToShares(uint256 assets) public view override returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply == 0 || totalAssets() == 0) return assets;
+        return (assets * supply) / totalAssets();
+    }
+
+    /// @inheritdoc IERC4626
+    function convertToAssets(uint256 shares) public view override returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply == 0) return shares;
+        return (shares * totalAssets()) / supply;
+    }
+
+    /// @inheritdoc IERC4626
+    function maxDeposit(address) public pure override returns (uint256) {
+        return MAX_DEPOSIT_PER_TX;
+    }
+
+    /// @inheritdoc IERC4626
+    function maxMint(address) public pure override returns (uint256) {
+        return type(uint256).max;
+    }
+
+    /// @inheritdoc IERC4626
+    function maxWithdraw(address owner) public view override returns (uint256) {
+        return convertToAssets(balanceOf(owner));
+    }
+
+    /// @inheritdoc IERC4626
+    function maxRedeem(address owner) public view override returns (uint256) {
+        return balanceOf(owner);
+    }
+
+    /// @inheritdoc IERC4626
+    function previewDeposit(uint256 assets) public view override returns (uint256) {
+        return convertToShares(assets);
+    }
+
+    /// @inheritdoc IERC4626
+    function previewMint(uint256 shares) public view override returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply == 0 || totalAssets() == 0) return shares;
+        return (shares * totalAssets() + supply - 1) / supply; // round up
+    }
+
+    /// @inheritdoc IERC4626
+    function previewWithdraw(uint256 assets) public view override returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply == 0) return assets;
+        return (assets * supply + totalAssets() - 1) / totalAssets(); // round up
+    }
+
+    /// @inheritdoc IERC4626
+    function previewRedeem(uint256 shares) public view override returns (uint256) {
+        return convertToAssets(shares);
+    }
+
+    // ── ERC-4626: Core State-Changing Functions ──────────────────────────────
+
+    /// @inheritdoc IERC4626
+    /// @param assets Amount of `asset` tokens to deposit
+    /// @param receiver Address to receive vault share tokens
+    function deposit(uint256 assets, address receiver)
+        public
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 shares)
+    {
+        if (assets == 0) revert ZeroAmount();
+
+        // Collect management fee before share calculation changes
+        _collectManagementFee();
+
+        shares = previewDeposit(assets);
+        if (shares == 0) revert ZeroAmount();
+
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+
+        _mint(receiver, shares);
+
+        // Forward to strategy for liquidity provision
+        uint256 bal0 = asset.balanceOf(address(this));
+        asset.forceApprove(address(strategy), bal0);
+        strategy.addLiquidity(bal0, 0);
+
+        emit Deposit(msg.sender, receiver, assets, shares);
+    }
+
+    /// @inheritdoc IERC4626
+    /// @param shares Amount of share tokens to mint (assets are computed)
+    /// @param receiver Address to receive vault share tokens
+    function mint(uint256 shares, address receiver)
+        public
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 assets)
+    {
+        if (shares == 0) revert ZeroAmount();
+
+        _collectManagementFee();
+
+        assets = previewMint(shares);
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+
+        _mint(receiver, shares);
+
+        uint256 bal0 = asset.balanceOf(address(this));
+        asset.forceApprove(address(strategy), bal0);
+        strategy.addLiquidity(bal0, 0);
+
+        emit Deposit(msg.sender, receiver, assets, shares);
+    }
+
+    /// @inheritdoc IERC4626
+    /// @param assets Exact amount of assets to receive
+    /// @param receiver Address to receive the assets
+    /// @param owner Address whose shares will be burned
+    function withdraw(uint256 assets, address receiver, address owner)
+        public
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 shares)
+    {
+        if (assets == 0) revert ZeroAmount();
+
+        _collectManagementFee();
+
+        shares = previewWithdraw(assets);
+        if (balanceOf(owner) < shares) revert InsufficientShares();
+
+        if (msg.sender != owner) {
+            _spendAllowance(owner, msg.sender, shares);
+        }
+
+        _burn(owner, shares);
+        _withdrawFromStrategy(shares, assets, receiver);
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+    }
+
+    /// @inheritdoc IERC4626
+    /// @param shares Exact amount of shares to redeem
+    /// @param receiver Address to receive the assets
+    /// @param owner Address whose shares will be burned
+    function redeem(uint256 shares, address receiver, address owner)
+        public
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 assets)
+    {
+        if (shares == 0) revert ZeroAmount();
+        if (balanceOf(owner) < shares) revert InsufficientShares();
+
+        _collectManagementFee();
+
+        assets = previewRedeem(shares);
+
+        if (msg.sender != owner) {
+            _spendAllowance(owner, msg.sender, shares);
+        }
+
+        _burn(owner, shares);
+        _withdrawFromStrategy(shares, assets, receiver);
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+    }
+
+    // ── Legacy convenience wrappers (maintains backward compat) ──────────────
+
+    /// @notice Deposit with slippage protection (minShares).
+    ///         Wraps ERC-4626 deposit() with an explicit shares floor check.
+    function depositWithMinShares(uint256 assets, uint256 minShares)
+        external
+        returns (uint256 shares)
+    {
+        shares = deposit(assets, msg.sender);
+        if (shares < minShares) revert MaxSlippageExceeded();
+    }
+
+    /// @notice Redeem shares with a minimum asset floor (slippage protection).
+    function redeemWithMinAssets(uint256 shares, uint256 minAssets)
+        external
+        returns (uint256 assets)
+    {
+        assets = redeem(shares, msg.sender, msg.sender);
+        if (assets < minAssets) revert MaxSlippageExceeded();
+    }
+
+    // ── Keeper functions ──────────────────────────────────────────────────────
+
+    /// @notice Trigger fee compounding (callable by keeper or anyone)
+    function compoundFees() external nonReentrant whenNotPaused {
+        (uint256 fees0, uint256 fees1) = strategy.collectAndCompound();
+
+        // Take performance fee from collected fees
+        uint256 perfFee0 = (fees0 * performanceFeeBps) / 10000;
+        uint256 perfFee1 = (fees1 * performanceFeeBps) / 10000;
+        if (perfFee0 > 0) asset.safeTransfer(treasury, perfFee0);
+        if (perfFee1 > 0) strategy.token1().safeTransfer(treasury, perfFee1);
+
+        emit FeesCharged(perfFee0, perfFee1);
+    }
+
+    // ── Admin ─────────────────────────────────────────────────────────────────
+
+    function setTreasury(address _treasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        treasury = _treasury;
+        emit TreasuryUpdated(_treasury);
+    }
+
+    function setPerformanceFee(uint256 _bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_bps <= 2000, "Max 20%");
+        performanceFeeBps = _bps;
+        emit PerformanceFeeUpdated(_bps);
+    }
+
+    function setManagementFee(uint256 _bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_bps <= 200, "Max 2%");
+        managementFeeBps = _bps;
+    }
+
+    function pause()   external onlyRole(EMERGENCY_ROLE) { _pause(); }
+    function unpause() external onlyRole(EMERGENCY_ROLE) { _unpause(); }
+
+    // ── Internal ──────────────────────────────────────────────────────────────
+
+    /// @dev Withdraw assets from strategy and send to receiver
+    function _withdrawFromStrategy(uint256 shares, uint256, address receiver) internal {
+        uint256 supply = totalSupply(); // already burned at call site
+        // Total supply before burn was supply + shares (caller already burned)
+        // Proportion = shares / (supply + shares)
+        uint128 totalLiq = _getPositionLiquidity();
+        uint128 liquidityToRemove = totalLiq == 0
+            ? 0
+            : uint128((uint256(shares) * uint256(totalLiq)) / (supply + shares));
+
+        if (liquidityToRemove > 0) {
+            strategy.removeLiquidity(liquidityToRemove, receiver);
+        } else {
+            // Fallback: transfer idle vault balance if any
+            uint256 idle = asset.balanceOf(address(this));
+            if (idle > 0) {
+                asset.safeTransfer(receiver, idle);
+            }
+        }
+    }
+
+    function _collectManagementFee() internal {
+        uint256 elapsed = block.timestamp - lastFeeTimestamp;
+        if (elapsed == 0 || totalSupply() == 0) return;
+
+        // Annual management fee, pro-rated by elapsed time
+        uint256 total = totalAssets();
+        uint256 annualFee = (total * managementFeeBps) / 10000;
+        uint256 fee = (annualFee * elapsed) / 365 days;
+
+        if (fee > 0 && asset.balanceOf(address(this)) >= fee) {
+            asset.safeTransfer(treasury, fee);
+            emit FeesCharged(0, fee);
+        }
+        lastFeeTimestamp = block.timestamp;
+    }
+
+    function _getPositionLiquidity() internal view returns (uint128) {
+        if (!strategy.positionActive()) return 0;
+        (,,,,,,,uint128 liquidity,,,,) = strategy.positionManager().positions(strategy.positionTokenId());
+        return liquidity;
+    }
+
+    // ── ERC-4626 overrides for decimals ───────────────────────────────────────
+
+    /// @inheritdoc IERC4626
+    function decimals() public view override(ERC20, IERC4626) returns (uint8) {
+        return ERC20.decimals();
+    }
+}
