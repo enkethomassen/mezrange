@@ -1,0 +1,49 @@
+{
+  "transactions": [
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    },
+    {
+      "rpc": "https://rpc.test.mezo.org"
+    }
+  ]
+}

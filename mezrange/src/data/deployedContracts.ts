@@ -29,25 +29,25 @@ export const MEZO_MAINNET = {
  */
 export const DEPLOYED_CONTRACTS = {
   testnet: {
-    // Vaults — deployed via DeployTestnetDirect on 2026-04-29
+    // Vaults — redeployed via DeployTestnetDirect on 2026-05-09 (slot0 fix)
     vaults: {
       btcMusd: {
-        vault:    '0xd4eCCd598239Be39492370e2F3f048A5C3723D41', // MezRangeVault MUSD/BTC-50
-        strategy: '0x439f267A6C924138a8950202C1778D222412f8Ac', // MezRangeStrategyV2 MUSD/BTC-50
+        vault:    '0x64c709A6cDc72fc0A72Ac47dF8CBbd97Ec6B25C3', // MezRangeVault MUSD/BTC-50
+        strategy: '0xbb023d16336BF2A7657cFC7aBeCaC769Ffc26565', // MezRangeStrategyV2 MUSD/BTC-50
         token0:   '0x118917a40FAF1CD7a13dB0Ef56C86De7973Ac503', // MUSD
         token1:   '0x7b7C000000000000000000000000000000000000', // BTC (Mezo)
         pool:     '0x026dB82AC7ABf60Bf1a81317c9DbD63702B85850', // MUSD/BTC 50bps pool
       },
       mezoMusd: {
-        vault:    '0x138641201a6e844e2a3136Ae7A4f9637449c956d', // MezRangeVault MUSD/MEZO-200
-        strategy: '0x73027182C07fb3cD0b48a56d5BD44ef163D974a2', // MezRangeStrategyV2 MUSD/MEZO-200
+        vault:    '0xA3c7466e5b69BF909C9De70a361143bc00e53FA7', // MezRangeVault MUSD/MEZO-200
+        strategy: '0xf4A4E665a0fDC4009872337fAa7e5eEf5cF831d9', // MezRangeStrategyV2 MUSD/MEZO-200
         token0:   '0x118917a40FAF1CD7a13dB0Ef56C86De7973Ac503', // MUSD
         token1:   '0x7b7C000000000000000000000000000000000001', // MEZO
         pool:     '0x4CB9e8a9d0a2A72d3B0Eb6Ed1F56fa6f6EA50BEA', // MUSD/MEZO 200bps pool
       },
       btcMezo: {
-        vault:    '0x3A91515895fc5A532A712e2027357bC474a0C188', // MezRangeVault MUSD/BTC-10
-        strategy: '0x575631D32f91A6613631aF2D9A83464943c259E3', // MezRangeStrategyV2 MUSD/BTC-10
+        vault:    '0x83a9F46C084184ae8f3B4eB4265FB081823E5013', // MezRangeVault MUSD/BTC-10
+        strategy: '0x7ED3d6793273f434851385854d2779d20c90b3A5', // MezRangeStrategyV2 MUSD/BTC-10
         token0:   '0x118917a40FAF1CD7a13dB0Ef56C86De7973Ac503', // MUSD
         token1:   '0x7b7C000000000000000000000000000000000000', // BTC (Mezo)
         pool:     '0xFe31b6033BCda0ebEc9FB789ee21bbc400175997', // MUSD/BTC 10bps pool
