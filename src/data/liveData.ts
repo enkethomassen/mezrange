@@ -11,22 +11,24 @@ import { ticksToRange } from '../hooks/usePrices';
 
 /**
  * Convert a Uniswap V3 pool tick to a human-readable price for the given pair.
- * token0 = MUSD (18 dec), token1 = BTC or MEZO (18 dec).
- * price = 1.0001^tick = token0 per token1 = USD per asset.
+ *
+ * In every Mezo pool we deploy, MUSD is token0 (its address sorts lower than BTC or MEZO).
+ * Uniswap V3 defines price as token1/token0, so for a MUSD/X pool `1.0001^tick` returns
+ * X-per-MUSD. The UI wants USD-per-X, which is the inverse: `1 / 1.0001^tick = 1.0001^-tick`.
+ * Ticks for BTC at ~$100k are large NEGATIVE (~-115k); the inverted form produces the
+ * expected positive USD price.
  */
 export function tickToHumanPrice(tick: number, pair: string): number {
   if (tick === 0) return 0;
-  const raw = Math.pow(1.0001, tick);
+  const raw = Math.pow(1.0001, -tick);
   if (pair.includes('BTC') && pair.includes('mUSD')) {
-    // price in USD/BTC
     return Math.round(raw * 100) / 100;
   }
   if (pair.includes('MEZO') && pair.includes('mUSD')) {
-    // price in USD/MEZO
-    return parseFloat(raw.toFixed(4));
+    return parseFloat(raw.toFixed(6));
   }
-  // BTC/MEZO: price in MEZO/BTC
-  return Math.round(raw * 100) / 100;
+  // Fallback (no BTC/MEZO pool is live)
+  return parseFloat(raw.toFixed(4));
 }
 
 /** Estimate APY from on-chain fees and TVL (annualised from last rebalance) */
@@ -75,7 +77,7 @@ const VAULT_META: Record<string, {
     performanceFee: 10,
     managementFee: 1,
   },
-  'vault-btc-mezo': {
+  'vault-btc-musd-10': {
     name: 'BTC/mUSD Vault (10 bps)',
     pair: 'BTC/mUSD (10 bps)',
     token0Symbol: 'MUSD',

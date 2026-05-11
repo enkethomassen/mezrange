@@ -31,35 +31,49 @@ function getVaultAddressMap(network: 'testnet' | 'mainnet') {
       token0:   contracts.vaults.mezoMusd.token0,
       pool:     contracts.vaults.mezoMusd.pool,
     },
-    'vault-btc-mezo': {
-      vault:    contracts.vaults.btcMezo.vault,
-      strategy: contracts.vaults.btcMezo.strategy,
-      token0:   contracts.vaults.btcMezo.token0,
-      pool:     contracts.vaults.btcMezo.pool,
+    'vault-btc-musd-10': {
+      vault:    contracts.vaults.btcMusd10.vault,
+      strategy: contracts.vaults.btcMusd10.strategy,
+      token0:   contracts.vaults.btcMusd10.token0,
+      pool:     contracts.vaults.btcMusd10.pool,
     },
   } satisfies Record<string, { vault: string; strategy: string; token0: string; pool: string }>;
 }
 
 interface VaultModalProps {
   vault: Vault | null;
+  /** Sibling vaults so the strategy picker can route to a vault that uses the chosen strategy. */
+  liveVaults?: Vault[];
+  /** Switch the modal to a different vault when the strategy picker selects one. */
+  onSelectVault?: (v: Vault) => void;
   onClose: () => void;
   walletAddress: string | undefined;
   isConnected: boolean;
   network?: 'testnet' | 'mainnet';
 }
 
+// Each strategy maps to the deployed vault that uses it on-chain. The deposit
+// modal's strategy picker switches the selected vault rather than mutating an
+// on-chain parameter — strategy is fixed at deploy time in MezRangeStrategyV2.
 const strategyConfig = {
-  tight:  { label: 'Tight ±2–5%',   desc: 'High fees, high rebalance frequency', color: 'red'   },
-  medium: { label: 'Medium ±5–15%', desc: 'Balanced risk/reward',                 color: 'amber' },
-  wide:   { label: 'Wide ±15–50%',  desc: 'Lower fees, fewer rebalances',          color: 'green' },
+  tight:  { label: 'Tight ±3%',  desc: 'High fees, frequent rebalances', color: 'red'   },
+  medium: { label: 'Medium ±10%', desc: 'Balanced risk/reward',            color: 'amber' },
+  wide:   { label: 'Wide ±30%',  desc: 'Lower fees, fewer rebalances',    color: 'green' },
 };
 
-export default function VaultModal({ vault, onClose, walletAddress, isConnected, network = 'testnet' }: VaultModalProps) {
+export default function VaultModal({
+  vault,
+  liveVaults = [],
+  onSelectVault,
+  onClose,
+  walletAddress,
+  isConnected,
+  network = 'testnet',
+}: VaultModalProps) {
   const [tab, setTab] = useState<'deposit' | 'withdraw' | 'history'>('deposit');
   const [amount, setAmount] = useState('');
-  const [selectedStrategy, setSelectedStrategy] = useState<'tight' | 'medium' | 'wide'>(vault?.strategy ?? 'medium');
 
-  const vaultId = (vault?.id ?? 'vault-btc-musd') as 'vault-btc-musd' | 'vault-mezo-musd' | 'vault-btc-mezo';
+  const vaultId = (vault?.id ?? 'vault-btc-musd') as 'vault-btc-musd' | 'vault-mezo-musd' | 'vault-btc-musd-10';
   const addrs = getVaultAddressMap(network)[vaultId];
   const contractsDeployed = addrs && isDeployed(addrs.vault);
 
@@ -375,6 +389,39 @@ export default function VaultModal({ vault, onClose, walletAddress, isConnected,
                         Insufficient {vault.token0Symbol} balance. Need {(amountNum - tokenBalance.balanceHuman).toLocaleString(undefined, { maximumFractionDigits: 4 })} more.
                       </div>
                     )}
+
+                    {/* MUSD acquisition hint — shown when wallet has < required MUSD.
+                        MUSD on Mezo testnet is not on the BTC/MEZO faucet; users acquire it
+                        by opening a Borrow position against BTC collateral on Mezo's CDP UI. */}
+                    {isConnected && vault.token0Symbol === 'MUSD' && !tokenBalance.isLoading
+                      && (amountNum > 0 ? !hasBalance : tokenBalance.balanceHuman <= 0) && (
+                      <div className="flex items-start gap-2 text-xs text-amber-300 bg-amber-500/10 rounded-lg px-3 py-2 mt-1 border border-amber-500/20">
+                        <Wallet className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-amber-400" />
+                        <div className="leading-relaxed">
+                          <span className="font-semibold text-amber-200">Need MUSD?</span>{' '}
+                          The Mezo faucet only emits BTC and MEZO. Acquire MUSD by opening a
+                          Borrow position against BTC collateral.
+                          <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1">
+                            <a
+                              href="https://app.test.mezo.org/borrow"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-amber-200 underline hover:text-amber-100 transition-colors inline-flex items-center gap-1"
+                            >
+                              Borrow MUSD <ExternalLink className="w-3 h-3" />
+                            </a>
+                            <a
+                              href="https://faucet.test.mezo.org/"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-amber-200 underline hover:text-amber-100 transition-colors inline-flex items-center gap-1"
+                            >
+                              BTC/MEZO faucet <ExternalLink className="w-3 h-3" />
+                            </a>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -449,7 +496,8 @@ export default function VaultModal({ vault, onClose, walletAddress, isConnected,
                   </div>
                 </div>
 
-                {/* Strategy display (read-only) */}
+                {/* Strategy picker — switches the selected vault to whichever
+                    deployed vault uses the chosen range strategy on-chain. */}
                 {tab === 'deposit' && (
                   <div>
                     <label className="text-xs text-slate-400 font-medium uppercase tracking-wider block mb-2">
@@ -458,26 +506,39 @@ export default function VaultModal({ vault, onClose, walletAddress, isConnected,
                     <div className="grid grid-cols-3 gap-2 mb-3">
                       {(Object.keys(strategyConfig) as Array<keyof typeof strategyConfig>).map((s) => {
                         const cfg = strategyConfig[s];
-                        const active = selectedStrategy === s;
+                        const active = vault.strategy === s;
+                        // Find the deployed vault whose StrategyType matches `s`.
+                        const target = liveVaults.find(v => v.strategy === s);
+                        const canRoute = !!target && !!onSelectVault && target.id !== vault.id;
                         return (
                           <button
                             key={s}
                             type="button"
-                            onClick={() => setSelectedStrategy(s)}
-                            disabled
+                            onClick={() => { if (canRoute && target && onSelectVault) onSelectVault(target); }}
+                            disabled={!target || active}
+                            title={target ? `${target.name} (${target.pair})` : 'No deployed vault for this strategy'}
                             className={clsx(
-                              'rounded-xl p-3 text-left transition-all border disabled:cursor-not-allowed disabled:opacity-70',
-                              active ? 'bg-orange-500/10 border-orange-500/40' : 'glass border-transparent'
+                              'rounded-xl p-3 text-left transition-all border disabled:cursor-not-allowed',
+                              active
+                                ? 'bg-orange-500/10 border-orange-500/40'
+                                : canRoute
+                                  ? 'glass border-transparent hover:border-orange-500/30 cursor-pointer'
+                                  : 'glass border-transparent opacity-50',
                             )}
                           >
                             <div className="text-xs font-semibold text-white mb-0.5">{cfg.label}</div>
                             <div className="text-xs text-slate-500">{cfg.desc}</div>
+                            {target && !active && (
+                              <div className="text-[10px] text-orange-400 mt-1 truncate">
+                                Switch to {target.pair}
+                              </div>
+                            )}
                           </button>
                         );
                       })}
                     </div>
                     <div className="text-xs text-slate-500">
-                      Strategy is fixed by the deployed vault. Picker is display-only.
+                      Each deployed vault has a fixed on-chain range strategy. Picking one routes you to that vault.
                     </div>
                   </div>
                 )}

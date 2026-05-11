@@ -38,16 +38,34 @@ contract MezRangeVault is ERC20, IERC4626, AccessControl, ReentrancyGuard, Pausa
     uint256 public managementFeeBps  = 100;   // 1% annual management fee
     uint256 public lastFeeTimestamp;
 
+    // ── Admin-change timelock ────────────────────────────────────────────────
+    // All fee + treasury changes go through a 2-step propose/execute with a
+    // mandatory minimum delay. This stops a compromised admin from instantly
+    // routing future fees to themselves before users can exit. Caps on
+    // performanceFeeBps (≤2000) and managementFeeBps (≤200) are still enforced.
+    uint256 public constant ADMIN_TIMELOCK_DELAY = 2 days;
+
+    enum PendingKind { NONE, PERFORMANCE_FEE, MANAGEMENT_FEE, TREASURY }
+    PendingKind public pendingKind;
+    uint256     public pendingValue;     // fee bps OR uint160(address) cast
+    uint256     public pendingEta;       // earliest block.timestamp at which executeAdminChange may run
+
     // ── Events ───────────────────────────────────────────────────────────────
     event FeesCharged(uint256 performanceFee, uint256 managementFee);
     event TreasuryUpdated(address newTreasury);
     event PerformanceFeeUpdated(uint256 newBps);
+    event ManagementFeeUpdated(uint256 newBps);
+    event AdminChangeProposed(PendingKind indexed kind, uint256 value, uint256 eta);
+    event AdminChangeCancelled(PendingKind indexed kind);
 
     // ── Errors ───────────────────────────────────────────────────────────────
     error ZeroAmount();
     error InsufficientShares();
     error MaxSlippageExceeded();
     error ExceedsMaxDeposit();
+    error NoPendingChange();
+    error TimelockNotElapsed();
+    error PendingChangeExists();
 
     // ── ERC-4626 constants ────────────────────────────────────────────────────
     uint256 public constant MAX_DEPOSIT_PER_TX = type(uint256).max;
@@ -255,26 +273,72 @@ contract MezRangeVault is ERC20, IERC4626, AccessControl, ReentrancyGuard, Pausa
             strategy.addLiquidity(net0, net1);
         }
 
-        emit FeesCharged(perfFee0, 0);
+        emit FeesCharged(perfFee0, perfFee1);
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
+    //
+    // Fee and treasury changes go through propose → wait ADMIN_TIMELOCK_DELAY →
+    // execute. Only one pending change is allowed at a time; queueing a new one
+    // requires cancelling the prior. Caps are still validated on propose so
+    // executing the queued value cannot exceed bounds even if state drifted.
 
-    function setTreasury(address _treasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(_treasury != address(0), "Zero treasury");
-        treasury = _treasury;
-        emit TreasuryUpdated(_treasury);
-    }
-
-    function setPerformanceFee(uint256 _bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function proposePerformanceFee(uint256 _bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_bps <= 2000, "Max 20%");
-        performanceFeeBps = _bps;
-        emit PerformanceFeeUpdated(_bps);
+        _enqueue(PendingKind.PERFORMANCE_FEE, _bps);
     }
 
-    function setManagementFee(uint256 _bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function proposeManagementFee(uint256 _bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_bps <= 200, "Max 2%");
-        managementFeeBps = _bps;
+        _enqueue(PendingKind.MANAGEMENT_FEE, _bps);
+    }
+
+    function proposeTreasury(address _treasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_treasury != address(0), "Zero treasury");
+        _enqueue(PendingKind.TREASURY, uint256(uint160(_treasury)));
+    }
+
+    function cancelAdminChange() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (pendingKind == PendingKind.NONE) revert NoPendingChange();
+        emit AdminChangeCancelled(pendingKind);
+        _clearPending();
+    }
+
+    function executeAdminChange() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (pendingKind == PendingKind.NONE)      revert NoPendingChange();
+        if (block.timestamp < pendingEta)         revert TimelockNotElapsed();
+
+        PendingKind kind = pendingKind;
+        uint256 value    = pendingValue;
+        _clearPending();
+
+        if (kind == PendingKind.PERFORMANCE_FEE) {
+            performanceFeeBps = value;
+            emit PerformanceFeeUpdated(value);
+        } else if (kind == PendingKind.MANAGEMENT_FEE) {
+            // Accrue any management fees owed under the old rate before changing.
+            _collectManagementFee();
+            managementFeeBps = value;
+            emit ManagementFeeUpdated(value);
+        } else if (kind == PendingKind.TREASURY) {
+            address newTreasury = address(uint160(value));
+            treasury = newTreasury;
+            emit TreasuryUpdated(newTreasury);
+        }
+    }
+
+    function _enqueue(PendingKind kind, uint256 value) internal {
+        if (pendingKind != PendingKind.NONE) revert PendingChangeExists();
+        pendingKind  = kind;
+        pendingValue = value;
+        pendingEta   = block.timestamp + ADMIN_TIMELOCK_DELAY;
+        emit AdminChangeProposed(kind, value, pendingEta);
+    }
+
+    function _clearPending() internal {
+        pendingKind  = PendingKind.NONE;
+        pendingValue = 0;
+        pendingEta   = 0;
     }
 
     function pause()   external onlyRole(EMERGENCY_ROLE) { _pause(); }

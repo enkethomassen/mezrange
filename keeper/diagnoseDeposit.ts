@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 import { DEPLOYED_CONTRACTS } from '../src/data/deployedContracts';
 
-type VaultKey = 'btcMusd' | 'mezoMusd' | 'btcMezo';
+type VaultKey = 'btcMusd' | 'mezoMusd' | 'btcMusd10';
 
 const RPC_URL = process.env.RPC_URL ?? 'https://rpc.test.mezo.org';
 
@@ -52,7 +52,7 @@ function format(value: bigint, decimals = 18): string {
 
 function parseVaultKey(raw: string | undefined): VaultKey {
   if (!raw) return 'btcMusd';
-  if (raw === 'btcMusd' || raw === 'mezoMusd' || raw === 'btcMezo') return raw;
+  if (raw === 'btcMusd' || raw === 'mezoMusd' || raw === 'btcMusd10') return raw;
   throw new Error(`Unsupported vault key: ${raw}`);
 }
 

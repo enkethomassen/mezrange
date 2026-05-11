@@ -62,7 +62,7 @@ export default function App() {
   const vaultEntries = [
     { name: 'MezRangeVault (BTC/mUSD)',  addr: contractsNet.vaults.btcMusd.vault,    strat: contractsNet.vaults.btcMusd.strategy },
     { name: 'MezRangeVault (MEZO/mUSD)', addr: contractsNet.vaults.mezoMusd.vault,   strat: contractsNet.vaults.mezoMusd.strategy },
-    { name: 'MezRangeVault (BTC/mUSD 10 bps)',  addr: contractsNet.vaults.btcMezo.vault,    strat: contractsNet.vaults.btcMezo.strategy },
+    { name: 'MezRangeVault (BTC/mUSD 10 bps)',  addr: contractsNet.vaults.btcMusd10.vault,    strat: contractsNet.vaults.btcMusd10.strategy },
     { name: 'NonfungiblePositionManager', addr: contractsNet.positionManager,         strat: '' },
     { name: 'SwapRouter',                addr: contractsNet.swapRouter,              strat: '' },
     { name: 'Keeper Bot Wallet',         addr: contractsNet.keeperBot,               strat: '' },
@@ -328,6 +328,8 @@ export default function App() {
 
       <VaultModal
         vault={selectedVault ? (LIVE_VAULTS.find(v => v.id === selectedVault.id) ?? selectedVault) : null}
+        liveVaults={LIVE_VAULTS}
+        onSelectVault={setSelectedVault}
         onClose={() => setSelectedVault(null)}
         walletAddress={walletAddress}
         isConnected={isConnected}

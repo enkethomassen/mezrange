@@ -67,6 +67,12 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
     // Default 300 s matches twapSeconds. Raise on mainnet for extra safety.
     uint32  public minPoolAgeSecs = 300;
 
+    // Maximum allowed |spotTick - twapTick| in ticks. If the spot drifts further
+    // than this from the TWAP, write-paths that would otherwise consume manipulated
+    // spot prices revert. ~200 ticks ≈ 2%, well above normal block-to-block jitter
+    // on a real pool but small enough to make flash-loan price manipulation visible.
+    int24   public maxTwapDeviationTicks = 200;
+
     // Max iterations for iterative ratio optimizer in _rebalanceTokenRatio
     uint8   private constant MAX_RATIO_ITERS = 4;
     uint256 private constant Q96 = 0x1000000000000000000000000;
@@ -86,6 +92,8 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
     error NoActivePosition();
     error SlippageExceeded();
     error ZeroLiquidity();
+    error PoolTooYoung();
+    error PriceDeviatedFromTwap();
 
     constructor(
         address _positionManager,
@@ -128,6 +136,20 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         whenNotPaused
         returns (uint128 liquidity)
     {
+        // Opening (not increasing) a position requires:
+        //   1. The pool to have at least `minPoolAgeSecs` of observation history
+        //      (otherwise TWAP silently falls back to spot — a known manipulation
+        //      surface called out in the README).
+        //   2. Spot tick to be close to the TWAP tick. The first mint anchors the
+        //      vault's range around the live price; if spot has been pumped the
+        //      mint would lock in an attacker-chosen range. Subsequent
+        //      `increaseLiquidity` calls reuse the existing range, so this check
+        //      only applies on the open path.
+        if (!positionActive) {
+            _requireMinPoolAge();
+            _requireSpotNearTwap();
+        }
+
         (int24 tickLower, int24 tickUpper) = _calcOptimalRange();
 
         token0.safeTransferFrom(msg.sender, address(this), amount0);
@@ -306,13 +328,34 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         if (fees0 > 0 || fees1 > 0) {
             token0.forceApprove(address(positionManager), fees0);
             token1.forceApprove(address(positionManager), fees1);
+
+            // Slippage-protected re-mint of collected fees. Without min-amounts the
+            // keeper's compound tx is sandwichable: an attacker shifts the pool price
+            // so increaseLiquidity consumes far more of one side than the other and
+            // returns the rest as idle, where the share-price math then misvalues it.
+            (uint160 sqrtPriceX96,,,,,) = pool.slot0();
+            uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
+            uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
+            uint128 estLiq = LiquidityAmounts.getLiquidityForAmounts(
+                sqrtPriceX96, sqrtRatioAX96, sqrtRatioBX96, fees0, fees1
+            );
+            uint256 amount0Min = 0;
+            uint256 amount1Min = 0;
+            if (estLiq > 0) {
+                (uint256 est0, uint256 est1) = LiquidityAmounts.getAmountsForLiquidity(
+                    sqrtPriceX96, sqrtRatioAX96, sqrtRatioBX96, estLiq
+                );
+                amount0Min = est0 * (10000 - slippageBps) / 10000;
+                amount1Min = est1 * (10000 - slippageBps) / 10000;
+            }
+
             positionManager.increaseLiquidity(
                 INonfungiblePositionManager.IncreaseLiquidityParams({
                     tokenId:        positionTokenId,
                     amount0Desired: fees0,
                     amount1Desired: fees1,
-                    amount0Min:     0,
-                    amount1Min:     0,
+                    amount0Min:     amount0Min,
+                    amount1Min:     amount1Min,
                     deadline:       block.timestamp + 60
                 })
             );
@@ -343,37 +386,40 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
 
     // ── View: total value accounting ─────────────────────────────────────────
 
+    /// @notice Total assets under management denominated in token0.
+    /// @dev All valuation math uses a single TWAP-derived sqrtPrice. Mixing spot
+    ///      (`pool.slot0`) with TWAP for different terms — as the prior version did —
+    ///      lets a flash-swap manipulate `getAmountsForLiquidity` and inflate or
+    ///      deflate share price in a single block. Using TWAP everywhere closes that.
     function totalValue() external view returns (uint256 value0) {
         uint256 idle0 = token0.balanceOf(address(this));
         uint256 idle1 = token1.balanceOf(address(this));
 
+        // Single price reference for the entire valuation pass. _getTwapTick falls
+        // back to the spot tick only when the pool has no observation history; the
+        // separate minPoolAgeSecs gate on addLiquidity guarantees that fallback is
+        // not exploitable during normal operation.
+        uint160 sqrtPriceTwap = TickMath.getSqrtRatioAtTick(_getTwapTick());
+
         uint256 pos0 = 0;
         uint256 pos1 = 0;
-        if (positionActive) {
-            (uint160 sqrtPriceX96,,,,,) = pool.slot0();
+        if (positionActive && sqrtPriceTwap > 0) {
             uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(currentTickLower);
             uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(currentTickUpper);
             (,,,,,,, uint128 liquidity,, ,uint128 tokensOwed0, uint128 tokensOwed1) =
                 positionManager.positions(positionTokenId);
             (pos0, pos1) = LiquidityAmounts.getAmountsForLiquidity(
-                sqrtPriceX96, sqrtRatioAX96, sqrtRatioBX96, liquidity
+                sqrtPriceTwap, sqrtRatioAX96, sqrtRatioBX96, liquidity
             );
             pos0 += tokensOwed0;
             pos1 += tokensOwed1;
         }
 
         uint256 total1 = idle1 + pos1;
-
-        if (total1 > 0) {
-            int24 twapTick = _getTwapTick();
-            uint160 sqrtPriceTwap = TickMath.getSqrtRatioAtTick(twapTick);
-            if (sqrtPriceTwap > 0) {
-                uint256 token1InToken0 = LiquidityAmounts.mulDiv(total1, Q96, uint256(sqrtPriceTwap));
-                token1InToken0 = LiquidityAmounts.mulDiv(token1InToken0, Q96, uint256(sqrtPriceTwap));
-                value0 = idle0 + pos0 + token1InToken0;
-            } else {
-                value0 = idle0 + pos0;
-            }
+        if (total1 > 0 && sqrtPriceTwap > 0) {
+            uint256 token1InToken0 = LiquidityAmounts.mulDiv(total1, Q96, uint256(sqrtPriceTwap));
+            token1InToken0 = LiquidityAmounts.mulDiv(token1InToken0, Q96, uint256(sqrtPriceTwap));
+            value0 = idle0 + pos0 + token1InToken0;
         } else {
             value0 = idle0 + pos0;
         }
@@ -404,6 +450,14 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         minPoolAgeSecs = _secs;
     }
 
+    /// @notice Set the maximum tolerated |spot - TWAP| in ticks for write-paths.
+    ///         Capped at 1000 (~10%) to keep the protection meaningful — anything
+    ///         higher effectively disables the manipulation guard.
+    function setMaxTwapDeviationTicks(int24 _ticks) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_ticks > 0 && _ticks <= 1000, "Out of bounds");
+        maxTwapDeviationTicks = _ticks;
+    }
+
     function pause()   external onlyRole(EMERGENCY_ROLE) { _pause(); }
     function unpause() external onlyRole(EMERGENCY_ROLE) { _unpause(); }
 
@@ -421,6 +475,35 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         int24 twapTick = _getTwapTick();
         uint24 widthBps = STRATEGY_WIDTHS[uint256(strategy)];
         (tickLower, tickUpper) = TickMath.calcRange(twapTick, widthBps, tickSpacing);
+    }
+
+    /// @dev Reverts unless the pool has at least `minPoolAgeSecs` seconds of
+    ///      observation history older than `block.timestamp`. Read from
+    ///      `observations(0)`, which Uniswap V3 always initialises at pool creation.
+    function _requireMinPoolAge() internal view {
+        (uint32 obsTs, , , bool initialized) = pool.observations(0);
+        if (!initialized || obsTs == 0) revert PoolTooYoung();
+        if (block.timestamp < uint256(obsTs) + uint256(minPoolAgeSecs)) revert PoolTooYoung();
+    }
+
+    /// @dev Reverts when spot tick has drifted more than `maxTwapDeviationTicks`
+    ///      from the TWAP tick. Callers use this before consuming spot in a
+    ///      state-changing path (rebalance, first-mint sizing). When the pool has
+    ///      no TWAP history the check is silently skipped — pool-age gating and
+    ///      the deposit-side slippage floor remain in force.
+    function _requireSpotNearTwap() internal view {
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = twapSeconds;
+        secondsAgos[1] = 0;
+        try pool.observe(secondsAgos) returns (int56[] memory cumulatives, uint160[] memory) {
+            int56 delta = cumulatives[1] - cumulatives[0];
+            int24 twapTick = int24(delta / int56(int32(twapSeconds)));
+            (, int24 spotTick,,,,) = pool.slot0();
+            int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
+            if (diff > maxTwapDeviationTicks) revert PriceDeviatedFromTwap();
+        } catch {
+            // No TWAP history — fall through. minPoolAgeSecs guards the open path.
+        }
     }
 
     /// @notice Compute TWAP tick. Falls back to spot if pool.observe() reverts
@@ -547,6 +630,11 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
     /// @dev Core rebalance logic — called by rebalance() and performUpkeep().
     ///      Must only be invoked after nonReentrant / whenNotPaused / role checks.
     function _performRebalance() internal {
+        // Refuse to rebalance when spot has drifted from TWAP — otherwise an
+        // attacker can pump the price into our range boundary, force a rebalance,
+        // and sandwich the ratio-swap that follows.
+        _requireSpotNearTwap();
+
         int24 oldLower = currentTickLower;
         int24 oldUpper = currentTickUpper;
 
@@ -562,15 +650,25 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         totalFeesCollected0 += fees0;
         totalFeesCollected1 += fees1;
 
-        // 2. Remove all liquidity
+        // 2. Remove all liquidity — slippage-protected: derive min amounts from the
+        //    same spot sqrtPrice the position manager will use for the burn quote.
+        //    Combined with the TWAP-derived swap floor below, this stops a flash-swap
+        //    from making the rebalance's exit price arbitrarily bad.
         (,,,,,,, uint128 currentLiquidity,,,, ) = positionManager.positions(positionTokenId);
         if (currentLiquidity > 0) {
+            (uint160 _decSqrt,,,,,) = pool.slot0();
+            (uint256 _decEst0, uint256 _decEst1) = LiquidityAmounts.getAmountsForLiquidity(
+                _decSqrt,
+                TickMath.getSqrtRatioAtTick(oldLower),
+                TickMath.getSqrtRatioAtTick(oldUpper),
+                currentLiquidity
+            );
             positionManager.decreaseLiquidity(
                 INonfungiblePositionManager.DecreaseLiquidityParams({
                     tokenId:    positionTokenId,
                     liquidity:  currentLiquidity,
-                    amount0Min: 0,
-                    amount1Min: 0,
+                    amount0Min: _decEst0 * (10000 - slippageBps) / 10000,
+                    amount1Min: _decEst1 * (10000 - slippageBps) / 10000,
                     deadline:   block.timestamp + 60
                 })
             );

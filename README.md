@@ -58,7 +58,7 @@ Users receive **share tokens (ERC-4626)** representing their proportional owners
                           │  collectAndCompound
                           │  (VAULT_ROLE required)
 ┌─────────────────────────▼────────────────────────────────────┐
-│           MezRangeStrategy  (Liquidity Manager)              │
+│         MezRangeStrategyV2  (Liquidity Manager)              │
 │                                                              │
 │  - Integrates Uniswap V3 NonfungiblePositionManager          │
 │  - addLiquidity: mints/increases position; auto-swaps 50%    │
@@ -123,15 +123,22 @@ Both fees are sent to the `treasury` address. Fee caps are enforced on-chain.
 | Role-based access control | `AccessControl`: `VAULT_ROLE`, `KEEPER_ROLE`, `EMERGENCY_ROLE`, `DEFAULT_ADMIN_ROLE` |
 | Emergency pause | Both contracts implement `Pausable`; paused by `EMERGENCY_ROLE` |
 | Slippage protection (deposits) | `previewDeposit` / `depositWithMinShares` |
-| Slippage protection (rebalance) | TWAP-derived `amount0Min`/`amount1Min` applied to re-mint |
+| Slippage protection (rebalance mint) | TWAP-derived `amount0Min`/`amount1Min` on re-mint |
+| Slippage protection (rebalance burn) | `decreaseLiquidity` uses sqrtPrice-derived min amounts with `slippageBps` floor |
+| Slippage protection (compound) | `collectAndCompound.increaseLiquidity` uses derived `amount0Min`/`amount1Min` (was 0/0) |
 | Slippage protection (removeLiquidity) | sqrtPrice-based estimation with `slippageBps` floor |
-| TWAP oracle | 5-minute TWAP via `pool.observe()`, falls back to spot only if pool has no history |
+| Single-price valuation | `totalValue()` uses one TWAP-derived sqrtPrice for both range-amount sizing and token1→token0 conversion (no spot/TWAP mixing) |
+| Spot-vs-TWAP divergence guard | First-position mint and rebalance revert with `PriceDeviatedFromTwap` when `\|spotTick − twapTick\| > maxTwapDeviationTicks` (default 200 ticks ≈ 2%) |
+| Minimum pool age | First-position mint requires the pool to have at least `minPoolAgeSecs` (default 300 s) of observation history; closes the TWAP-fallback manipulation surface |
+| TWAP oracle | 5-minute TWAP via `pool.observe()`; falls back to spot only on a brand-new pool, gated by the minimum-pool-age check |
+| Admin-change timelock | `setPerformanceFee` / `setManagementFee` / `setTreasury` replaced with `propose…` + `executeAdminChange` separated by `ADMIN_TIMELOCK_DELAY` (2 days). Single pending change at a time; `cancelAdminChange` clears it |
+| Fee caps | `≤ 20%` performance and `≤ 2%` annual management, enforced on-chain at propose-time |
 | Token rescue | Admin can recover stuck tokens when paused via `rescueTokens()` |
 | ERC721 safe receipt | `IERC721Receiver` implemented on strategy for safe NFT handling |
+| Keeper role pre-flight | Keeper bot verifies `KEEPER_ROLE` on every strategy and vault before starting its poll loop; exits with a clear error if any grant is missing |
 
 **Known limitations:**
-- The TWAP fallback to spot tick (for new pools) remains a manipulation surface. Consider requiring minimum pool age before activation.
-- Keeper bot is centralized. Consider migrating to Gelato or Chainlink Automation for trustless operation.
+- Keeper bot is centralized. The contracts also expose Gelato / Chainlink `checkUpkeep` / `performUpkeep`; either external automation can be wired by granting `KEEPER_ROLE` to its forwarder.
 
 ---
 
@@ -140,26 +147,36 @@ Both fees are sent to the `treasury` address. Fee caps are enforced on-chain.
 ```
 contracts/
 ├── MezRangeVault.sol              # ERC-4626 vault (full interface compliance)
-├── MezRangeStrategy.sol           # Uniswap V3 liquidity strategy
+├── MezRangeStrategyV2.sol         # Uniswap V3 liquidity strategy (Mezo testnet)
 ├── interfaces/
 │   ├── INonfungiblePositionManager.sol
 │   ├── IUniswapV3Pool.sol
-│   └── IUniswapV3SwapRouter.sol   # NEW: swap router interface
+│   └── IUniswapV3SwapRouter.sol
 └── libraries/
     ├── TickMath.sol               # Tick math + getSqrtRatioAtTick
-    └── LiquidityAmounts.sol       # NEW: Uniswap V3 liquidity math
+    └── LiquidityAmounts.sol       # Uniswap V3 liquidity math
 ```
 
 ### Mezo Testnet Deployments
 
-| Contract | Address | Explorer |
-|---|---|---|
-| MezRangeStrategy | `0x...` | [View](https://explorer.test.mezo.org) |
-| MezRangeVault (BTC/mUSD) | `0x...` | [View](https://explorer.test.mezo.org) |
-| MezRangeVault (MEZO/mUSD) | `0x...` | [View](https://explorer.test.mezo.org) |
-| MezRangeVault (BTC/MEZO) | `0x...` | [View](https://explorer.test.mezo.org) |
+Live deployments (Chain ID `31611`). Single source of truth lives in
+[`src/data/deployedContracts.ts`](./src/data/deployedContracts.ts).
 
-> Run `forge script script/Deploy.s.sol:Deploy` to deploy and get real addresses.
+| Pair / Fee | Strategy | Vault | Pool |
+|---|---|---|---|
+| MUSD/BTC 50 bps | [`0x5165BA…dfDb8`](https://explorer.test.mezo.org/address/0x5165BA96bf100d0139d488898403DCF06d2dfDb8) | [`0xc7B54E…645492`](https://explorer.test.mezo.org/address/0xc7B54Efc2416291c0A52615598C949aa97645492) | [`0x026dB8…85850`](https://explorer.test.mezo.org/address/0x026dB82AC7ABf60Bf1a81317c9DbD63702B85850) |
+| MUSD/MEZO 200 bps | [`0xc16dC0…0d714`](https://explorer.test.mezo.org/address/0xc16dC0e6d5aE12D2e192853Db16899f54130d714) | [`0x2BBA10…CA13Df`](https://explorer.test.mezo.org/address/0x2BBA10Aab8442F050B4DB8a3c2C0b4275dCA13Df) | [`0x4CB9e8…50BEA`](https://explorer.test.mezo.org/address/0x4CB9e8a9d0a2A72d3B0Eb6Ed1F56fa6f6EA50BEA) |
+| MUSD/BTC 10 bps | [`0x650218…3c0A9`](https://explorer.test.mezo.org/address/0x65021835c49cf529BDa1e5B6F65294114053c0A9) | [`0xD8Fdf1…37B0C`](https://explorer.test.mezo.org/address/0xD8Fdf1b0973B76C5902CC28281b4F31184437B0C) | [`0xFe31b6…75997`](https://explorer.test.mezo.org/address/0xFe31b6033BCda0ebEc9FB789ee21bbc400175997) |
+
+Shared infrastructure:
+
+| Component | Address |
+|---|---|
+| NonfungiblePositionManager | `0x9B753e11bFEd0D88F6e1D2777E3c7dac42F96062` |
+| SwapRouter | `0x3112908bB72ce9c26a321Eeb22EC8e051F3b6E6a` |
+| Keeper / Treasury wallet | `0x03ffb3720214bDB0DB5F5F71b6cE16B008f762d2` |
+
+> To redeploy: `forge script script/DeployTestnetDirect.s.sol:DeployTestnetDirect --rpc-url $RPC_URL --broadcast` and then update `src/data/deployedContracts.ts`.
 
 ---
 
@@ -193,24 +210,17 @@ cp .env.example .env
 ## Deployment
 
 ```bash
-# Deploy single vault
-forge script script/Deploy.s.sol:Deploy \
+# Deploy all three vaults (MUSD/BTC-50, MUSD/BTC-10, MUSD/MEZO-200) in one transaction.
+# Reads DEPLOYER_PK, KEEPER_ADDRESS, TREASURY_ADDRESS, POSITION_MANAGER, SWAP_ROUTER from env.
+forge script script/DeployTestnetDirect.s.sol:DeployTestnetDirect \
   --rpc-url $RPC_URL \
   --broadcast \
-  --verify \
-  -vvvv
-
-# Deploy all three vaults (BTC/mUSD, MEZO/mUSD, BTC/MEZO)
-forge script script/Deploy.s.sol:DeployMultiVault \
-  --rpc-url $RPC_URL \
-  --broadcast \
-  --verify \
   -vvvv
 ```
 
 After deployment:
-1. Copy deployed contract addresses to `src/data/deployedContracts.ts`
-2. Copy strategy addresses to `keeper/.env` as `STRATEGY_ADDRS`
+1. Copy the strategy + vault addresses printed at the end of the run into `src/data/deployedContracts.ts`.
+2. Copy strategy addresses to `keeper/.env` as `STRATEGY_ADDRS` (or rely on the defaults in the keeper, which read `DEPLOYED_CONTRACTS.testnet`).
 
 ### Environment Variables
 

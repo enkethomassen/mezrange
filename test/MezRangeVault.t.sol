@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../contracts/MezRangeVault.sol";
-import "../contracts/MezRangeStrategy.sol";
+import "../contracts/MezRangeStrategyV2.sol";
 import "./mocks/MockERC20.sol";
 import "./mocks/MockUniswapV3Pool.sol";
 import "./mocks/MockPositionManager.sol";
@@ -18,13 +18,19 @@ contract MezRangeVaultTest is Test {
     address bob     = makeAddr("bob");
 
     // ── Contracts ─────────────────────────────────────────────────────────────
-    MockERC20           token0;
-    MockERC20           token1;
-    MockUniswapV3Pool   pool;
-    MockPositionManager posManager;
-    MockSwapRouter      swapRouter;
-    MezRangeStrategy    strategy;
-    MezRangeVault       vault;
+    // Tests target MezRangeStrategyV2 — the production-deployed strategy.
+    // V2 accepts fee + tickSpacing directly in the constructor so it can support
+    // Mezo testnet pools whose fee→tickSpacing mapping diverges from Uniswap V3's.
+    MockERC20            token0;
+    MockERC20            token1;
+    MockUniswapV3Pool    pool;
+    MockPositionManager  posManager;
+    MockSwapRouter       swapRouter;
+    MezRangeStrategyV2   strategy;
+    MezRangeVault        vault;
+
+    uint24 constant POOL_FEE     = 3000;
+    int24  constant TICK_SPACING = 60;
 
     uint256 constant INITIAL_BALANCE = 100_000e18;
     uint256 constant DEPOSIT_AMOUNT  = 1_000e18;
@@ -39,17 +45,19 @@ contract MezRangeVaultTest is Test {
         token1 = new MockERC20("Token1", "TK1", 18);
 
         // Deploy mocks
-        pool       = new MockUniswapV3Pool(address(token0), address(token1), 3000);
+        pool       = new MockUniswapV3Pool(address(token0), address(token1), POOL_FEE);
         posManager = new MockPositionManager();
         swapRouter = new MockSwapRouter();
 
-        // Deploy strategy
-        strategy = new MezRangeStrategy(
+        // Deploy strategy (V2 takes fee + tickSpacing in the constructor)
+        strategy = new MezRangeStrategyV2(
             address(posManager),
             address(pool),
             address(swapRouter),
-            MezRangeStrategy.StrategyType.MEDIUM,
-            admin
+            MezRangeStrategyV2.StrategyType.MEDIUM,
+            admin,
+            POOL_FEE,
+            TICK_SPACING
         );
 
         // Deploy vault
@@ -286,11 +294,13 @@ contract MezRangeVaultTest is Test {
         int24 oldLower = strategy.currentTickLower();
         int24 oldUpper = strategy.currentTickUpper();
 
-        // Move price outside range
-        pool.setTick(strategy.currentTickUpper() + 500);
-
-        // TWAP: set cumulatives so TWAP returns tick +600
-        pool.setTickCumulatives(0, int56(600) * int56(int32(300)));
+        // Move price just outside range. Keep TWAP in sync with spot so the
+        // strategy's spot-vs-TWAP divergence guard (maxTwapDeviationTicks = 200)
+        // permits the rebalance — the guard is the manipulation defence; we are
+        // simulating normal drift, not manipulation.
+        int24 newSpot = strategy.currentTickUpper() + 50;
+        pool.setTick(newSpot);
+        pool.setTickCumulatives(0, int56(newSpot) * int56(int32(300)));
 
         vm.prank(keeper);
         strategy.rebalance();
@@ -315,14 +325,15 @@ contract MezRangeVaultTest is Test {
 
     function test_Rebalance_NoActivePosition_Reverts() public {
         vm.prank(keeper);
-        vm.expectRevert(MezRangeStrategy.NoActivePosition.selector);
+        vm.expectRevert(MezRangeStrategyV2.NoActivePosition.selector);
         strategy.rebalance();
     }
 
     function test_Rebalance_IncreasesRebalanceCount() public {
         _depositAndActivatePosition();
-        pool.setTick(strategy.currentTickUpper() + 200);
-        pool.setTickCumulatives(0, int56(200) * int56(int32(300)));
+        int24 newSpot = strategy.currentTickUpper() + 50;
+        pool.setTick(newSpot);
+        pool.setTickCumulatives(0, int56(newSpot) * int56(int32(300)));
 
         vm.prank(keeper);
         strategy.rebalance();
@@ -438,13 +449,13 @@ contract MezRangeVaultTest is Test {
     function test_EdgeCase_ZeroLiquidityRebalance_Reverts() public {
         // No position active
         vm.prank(keeper);
-        vm.expectRevert(MezRangeStrategy.NoActivePosition.selector);
+        vm.expectRevert(MezRangeStrategyV2.NoActivePosition.selector);
         strategy.rebalance();
     }
 
     function test_EdgeCase_RemoveLiquidityNoPosition_Reverts() public {
         vm.prank(address(vault));
-        vm.expectRevert(MezRangeStrategy.NoActivePosition.selector);
+        vm.expectRevert(MezRangeStrategyV2.NoActivePosition.selector);
         strategy.removeLiquidity(1, alice);
     }
 
@@ -467,9 +478,12 @@ contract MezRangeVaultTest is Test {
     function test_FailedSwap_RebalanceReverts() public {
         _depositAndActivatePosition();
 
-        // Move price out of range to trigger rebalance
-        pool.setTick(strategy.currentTickUpper() + 500);
-        pool.setTickCumulatives(0, int56(600) * int56(int32(300)));
+        // Move price out of range to trigger rebalance; keep TWAP aligned with
+        // spot so the divergence guard passes — we're testing the swap-failure
+        // path, not the manipulation guard.
+        int24 newSpot = strategy.currentTickUpper() + 50;
+        pool.setTick(newSpot);
+        pool.setTickCumulatives(0, int56(newSpot) * int56(int32(300)));
 
         // Force the swap router to revert on the next swap
         swapRouter.setRevert(true);

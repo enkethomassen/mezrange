@@ -17,13 +17,13 @@ const REBALANCED_TOPIC = '0x9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d
 const VAULT_IDS: Record<string, string> = {
   [DEPLOYED_CONTRACTS.testnet.vaults.btcMusd.strategy.toLowerCase()]:  'vault-btc-musd',
   [DEPLOYED_CONTRACTS.testnet.vaults.mezoMusd.strategy.toLowerCase()]: 'vault-mezo-musd',
-  [DEPLOYED_CONTRACTS.testnet.vaults.btcMezo.strategy.toLowerCase()]:  'vault-btc-mezo',
+  [DEPLOYED_CONTRACTS.testnet.vaults.btcMusd10.strategy.toLowerCase()]:  'vault-btc-musd-10',
 };
 
 const VAULT_PAIRS: Record<string, string> = {
   'vault-btc-musd':  'BTC/mUSD',
   'vault-mezo-musd': 'MEZO/mUSD',
-  'vault-btc-mezo':  'BTC/mUSD (10 bps)',
+  'vault-btc-musd-10':  'BTC/mUSD (10 bps)',
 };
 
 function decodeInt24(hex: string): number {
@@ -110,7 +110,7 @@ export function useRebalanceEvents(network: 'testnet' | 'mainnet' = 'testnet'): 
     const strategyAddresses = [
       DEPLOYED_CONTRACTS.testnet.vaults.btcMusd.strategy,
       DEPLOYED_CONTRACTS.testnet.vaults.mezoMusd.strategy,
-      DEPLOYED_CONTRACTS.testnet.vaults.btcMezo.strategy,
+      DEPLOYED_CONTRACTS.testnet.vaults.btcMusd10.strategy,
     ];
 
     const fetchEvents = async () => {

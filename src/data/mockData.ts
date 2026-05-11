@@ -90,7 +90,7 @@ export const VAULTS: Vault[] = [
     token1Color: '#8b5cf6',
   },
   {
-    id: 'vault-btc-mezo',
+    id: 'vault-btc-musd-10',
     name: 'BTC/mUSD Vault (10 bps)',
     pair: 'BTC/mUSD (10 bps)',
     token0: '',

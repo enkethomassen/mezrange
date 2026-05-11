@@ -45,7 +45,7 @@ export const DEPLOYED_CONTRACTS = {
         token1:   '0x7B7c000000000000000000000000000000000001', // MEZO
         pool:     '0x4CB9e8a9d0a2A72d3B0Eb6Ed1F56fa6f6EA50BEA', // MUSD/MEZO 200bps pool
       },
-      btcMezo: {
+      btcMusd10: {
         vault:    '0xD8Fdf1b0973B76C5902CC28281b4F31184437B0C', // MezRangeVault MUSD/BTC-10
         strategy: '0x65021835c49cf529BDa1e5B6F65294114053c0A9', // MezRangeStrategyV2 MUSD/BTC-10
         token0:   '0x118917a40FAF1CD7a13dB0Ef56C86De7973Ac503', // MUSD
@@ -62,7 +62,7 @@ export const DEPLOYED_CONTRACTS = {
     vaults: {
       btcMusd:  { vault: '', strategy: '', token0: '', token1: '', pool: '' },
       mezoMusd: { vault: '', strategy: '', token0: '', token1: '', pool: '' },
-      btcMezo:  { vault: '', strategy: '', token0: '', token1: '', pool: '' },
+      btcMusd10:  { vault: '', strategy: '', token0: '', token1: '', pool: '' },
     },
     positionManager: '',
     swapRouter:      '',

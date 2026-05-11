@@ -51,14 +51,14 @@ export function useProtocolStats(network: 'testnet' | 'mainnet' = 'testnet'): Pr
     walletAddress,
     contracts.vaults.mezoMusd.pool,
   );
-  const btcMezo = useVaultData(
-    contracts.vaults.btcMezo.vault,
-    contracts.vaults.btcMezo.strategy,
+  const btcMusd10 = useVaultData(
+    contracts.vaults.btcMusd10.vault,
+    contracts.vaults.btcMusd10.strategy,
     walletAddress,
-    contracts.vaults.btcMezo.pool,
+    contracts.vaults.btcMusd10.pool,
   );
 
-  const all = [btc, mezo, btcMezo];
+  const all = [btc, mezo, btcMusd10];
   const isLoading = all.some(d => d.isLoading);
   const hasLiveData = all.some(d => d.isDeployedOnChain);
 
@@ -92,7 +92,7 @@ export function useProtocolStats(network: 'testnet' | 'mainnet' = 'testnet'): Pr
     vaults: {
       'vault-btc-musd':  toVault(btc,     'vault-btc-musd'),
       'vault-mezo-musd': toVault(mezo,    'vault-mezo-musd'),
-      'vault-btc-mezo':  toVault(btcMezo, 'vault-btc-mezo'),
+      'vault-btc-musd-10':  toVault(btcMusd10, 'vault-btc-musd-10'),
     },
     isLoading,
     hasLiveData,

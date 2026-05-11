@@ -15,17 +15,28 @@
  *   VAULT_ADDRS     - Optional comma-separated vault addresses aligned with STRATEGY_ADDRS
  *   POLL_MS         - Poll interval in ms (default: 12000)
  *   COMPOUND_MS     - Compound interval in ms (default: 3600000)
+ *   MAX_GAS_GWEI    - Skip a tx if network gas price exceeds this (default: 50)
  */
 
 import { ethers } from 'ethers';
 import { DEPLOYED_CONTRACTS } from '../src/data/deployedContracts';
 
-const RPC_URL = process.env.RPC_URL ?? 'https://rpc.test.mezo.org';
-const KEEPER_PK = process.env.KEEPER_PK ?? '';
-const POLL_MS = parseInt(process.env.POLL_MS ?? '12000', 10);
-const COMPOUND_MS = parseInt(process.env.COMPOUND_MS ?? `${60 * 60 * 1000}`, 10);
+const RPC_URL      = process.env.RPC_URL ?? 'https://rpc.test.mezo.org';
+const KEEPER_PK    = process.env.KEEPER_PK ?? '';
+const POLL_MS      = parseInt(process.env.POLL_MS     ?? '12000', 10);
+const COMPOUND_MS  = parseInt(process.env.COMPOUND_MS ?? `${60 * 60 * 1000}`, 10);
 const MAX_GAS_GWEI = process.env.MAX_GAS_GWEI ?? '50';
 const MAX_GAS_PRICE = ethers.parseUnits(MAX_GAS_GWEI, 'gwei');
+
+// Recreate the JsonRpcProvider after this many consecutive network-class failures
+// across all watched vaults. Mezo RPC nodes occasionally hold a stale socket open.
+const PROVIDER_RESET_AFTER = 8;
+
+// Cap on per-vault backoff between failed attempts (5 minutes).
+const MAX_BACKOFF_MS = 5 * 60 * 1000;
+
+// keccak256("KEEPER_ROLE")
+const KEEPER_ROLE_HASH = ethers.keccak256(ethers.toUtf8Bytes('KEEPER_ROLE'));
 
 const STRATEGY_ABI = [
   'function shouldRebalance() external view returns (bool)',
@@ -34,10 +45,14 @@ const STRATEGY_ABI = [
   'function currentTickLower() external view returns (int24)',
   'function currentTickUpper() external view returns (int24)',
   'function positionActive() external view returns (bool)',
+  'function paused() external view returns (bool)',
+  'function hasRole(bytes32, address) external view returns (bool)',
 ];
 
 const VAULT_ABI = [
   'function compoundFees() external',
+  'function paused() external view returns (bool)',
+  'function hasRole(bytes32, address) external view returns (bool)',
 ];
 
 interface WatchedVault {
@@ -55,11 +70,30 @@ interface KeeperState {
   nextAttemptAt: number;
 }
 
+interface Runtime {
+  provider: ethers.JsonRpcProvider;
+  signer: ethers.Wallet;
+  networkFailures: number;
+}
+
 const state: Record<string, KeeperState> = {};
+let stopping = false;
+
+function ts(): string {
+  return new Date().toISOString();
+}
+
+function logInfo(label: string, msg: string): void {
+  console.log(`${ts()} [${label}] ${msg}`);
+}
+
+function logErr(label: string, msg: string): void {
+  console.error(`${ts()} [${label}] ${msg}`);
+}
 
 function configuredVaults(): WatchedVault[] {
   const envStrategies = (process.env.STRATEGY_ADDRS ?? '').split(',').map((v) => v.trim()).filter(Boolean);
-  const envVaults = (process.env.VAULT_ADDRS ?? '').split(',').map((v) => v.trim()).filter(Boolean);
+  const envVaults     = (process.env.VAULT_ADDRS    ?? '').split(',').map((v) => v.trim()).filter(Boolean);
 
   if (envStrategies.length > 0) {
     return envStrategies.map((strategy, index) => ({
@@ -71,23 +105,43 @@ function configuredVaults(): WatchedVault[] {
 
   const defaults = DEPLOYED_CONTRACTS.testnet.vaults;
   return [
-    { label: 'btc-musd-50', strategy: defaults.btcMusd.strategy, vault: defaults.btcMusd.vault },
-    { label: 'mezo-musd-200', strategy: defaults.mezoMusd.strategy, vault: defaults.mezoMusd.vault },
-    { label: 'btc-musd-10', strategy: defaults.btcMezo.strategy, vault: defaults.btcMezo.vault },
+    { label: 'btc-musd-50',   strategy: defaults.btcMusd.strategy,   vault: defaults.btcMusd.vault   },
+    { label: 'mezo-musd-200', strategy: defaults.mezoMusd.strategy,  vault: defaults.mezoMusd.vault  },
+    { label: 'btc-musd-10',   strategy: defaults.btcMusd10.strategy, vault: defaults.btcMusd10.vault },
   ];
 }
 
-function isRetryableError(error: unknown): boolean {
+function isNetworkError(error: unknown): boolean {
   const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
   return [
     'timeout',
     'network',
+    'temporarily unavailable',
+    'socket hang up',
+    'econnreset',
+    'econnrefused',
+    'enotfound',
+    'fetch failed',
+  ].some((fragment) => message.includes(fragment));
+}
+
+function isRetryableError(error: unknown): boolean {
+  if (isNetworkError(error)) return true;
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return [
     'nonce',
     'underpriced',
     'replacement fee too low',
-    'temporarily unavailable',
-    'socket hang up',
   ].some((fragment) => message.includes(fragment));
+}
+
+/**
+ * Backoff with ±15% jitter so multiple vaults that fail in the same cycle don't
+ * retry in lockstep against the RPC (thundering-herd).
+ */
+function jitter(ms: number): number {
+  const delta = ms * 0.15;
+  return Math.max(POLL_MS, Math.round(ms + (Math.random() * 2 - 1) * delta));
 }
 
 async function buildTxRequest(
@@ -96,14 +150,12 @@ async function buildTxRequest(
   signer: ethers.Wallet,
 ): Promise<ethers.TransactionRequest> {
   const provider = signer.provider;
-  if (!provider) {
-    throw new Error('Signer provider unavailable');
-  }
+  if (!provider) throw new Error('Signer provider unavailable');
 
-  const feeData = await provider.getFeeData();
+  const feeData  = await provider.getFeeData();
   const gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas ?? MAX_GAS_PRICE;
   if (gasPrice > MAX_GAS_PRICE) {
-    throw new Error(`Gas too high (${ethers.formatUnits(gasPrice, 'gwei')} gwei)`);
+    throw new Error(`Gas too high (${ethers.formatUnits(gasPrice, 'gwei')} gwei > ${MAX_GAS_GWEI})`);
   }
 
   const txRequest = method === 'rebalance'
@@ -129,26 +181,65 @@ async function sendManagedTx(
   contract: ethers.Contract,
   method: 'rebalance' | 'compoundFees',
   signer: ethers.Wallet,
+  label: string,
 ): Promise<ethers.TransactionReceipt | null> {
   const request = await buildTxRequest(contract, method, signer);
   const response = await signer.sendTransaction(request);
-  console.log(`[${method}] tx sent: ${response.hash}`);
+  logInfo(label, `${method} tx sent: ${response.hash}`);
   return response.wait();
 }
 
-async function runKeeperCycle(
-  watched: WatchedVault,
-  signer: ethers.Wallet,
+/**
+ * Verify the keeper wallet actually holds KEEPER_ROLE on every watched contract.
+ * Fails fast on startup so we don't burn a poll cycle on a guaranteed revert.
+ */
+async function preflight(
+  rt: Runtime,
+  watched: WatchedVault[],
 ): Promise<void> {
-  const strategy = new ethers.Contract(watched.strategy, STRATEGY_ABI, signer.provider);
-  const vault = watched.vault ? new ethers.Contract(watched.vault, VAULT_ABI, signer.provider) : null;
-  const vaultState = state[watched.strategy];
-
-  if (Date.now() < vaultState.nextAttemptAt) {
-    return;
+  logInfo('preflight', `keeper=${rt.signer.address}`);
+  const bal = await rt.provider.getBalance(rt.signer.address);
+  logInfo('preflight', `keeper native balance: ${ethers.formatEther(bal)}`);
+  if (bal === 0n) {
+    throw new Error('Keeper has zero native balance — top up before running');
   }
 
+  for (const v of watched) {
+    const strat = new ethers.Contract(v.strategy, STRATEGY_ABI, rt.provider);
+    const ok = await strat.hasRole(KEEPER_ROLE_HASH, rt.signer.address);
+    if (!ok) {
+      throw new Error(
+        `[${v.label}] strategy ${v.strategy} did not grant KEEPER_ROLE to ${rt.signer.address}`,
+      );
+    }
+    if (v.vault) {
+      const vault = new ethers.Contract(v.vault, VAULT_ABI, rt.provider);
+      const okV = await vault.hasRole(KEEPER_ROLE_HASH, rt.signer.address);
+      if (!okV) {
+        throw new Error(
+          `[${v.label}] vault ${v.vault} did not grant KEEPER_ROLE to ${rt.signer.address}`,
+        );
+      }
+    }
+    logInfo('preflight', `${v.label}: KEEPER_ROLE OK`);
+  }
+}
+
+async function runKeeperCycle(rt: Runtime, watched: WatchedVault): Promise<void> {
+  const strategy = new ethers.Contract(watched.strategy, STRATEGY_ABI, rt.provider);
+  const vault    = watched.vault ? new ethers.Contract(watched.vault, VAULT_ABI, rt.provider) : null;
+  const vs       = state[watched.strategy];
+
+  if (Date.now() < vs.nextAttemptAt) return;
+
   try {
+    // Skip work entirely if the strategy is paused — saves an RPC round and an estimateGas revert.
+    if (await strategy.paused()) {
+      vs.nextAttemptAt = 0;
+      vs.consecutiveFailures = 0;
+      return;
+    }
+
     const [positionActive, needsRebalance, lower, upper] = await Promise.all([
       strategy.positionActive(),
       strategy.shouldRebalance(),
@@ -157,64 +248,71 @@ async function runKeeperCycle(
     ]);
 
     if (positionActive && needsRebalance) {
-      console.log(`[${watched.label}] rebalance triggered for [${lower}, ${upper}]`);
-      const receipt = await sendManagedTx(strategy.connect(signer), 'rebalance', signer);
-      if (receipt?.status !== 1n) {
-        throw new Error('rebalance transaction reverted');
-      }
-      vaultState.totalRebalances += 1;
-      vaultState.lastRebalanceAt = Date.now();
-      vaultState.consecutiveFailures = 0;
-      vaultState.nextAttemptAt = 0;
+      logInfo(watched.label, `rebalance triggered (range [${lower}, ${upper}])`);
+      const receipt = await sendManagedTx(strategy.connect(rt.signer), 'rebalance', rt.signer, watched.label);
+      if (receipt?.status !== 1n) throw new Error('rebalance transaction reverted');
+      vs.totalRebalances += 1;
+      vs.lastRebalanceAt = Date.now();
+      vs.consecutiveFailures = 0;
+      vs.nextAttemptAt = 0;
       return;
     }
 
-    if (!vault) {
+    if (!vault) return;
+    if (await vault.paused()) {
+      vs.nextAttemptAt = 0;
+      vs.consecutiveFailures = 0;
       return;
     }
 
-    const compoundDue = Date.now() - vaultState.lastCompoundAt >= COMPOUND_MS;
+    const compoundDue = Date.now() - vs.lastCompoundAt >= COMPOUND_MS;
     if (!positionActive || !compoundDue) {
-      vaultState.consecutiveFailures = 0;
-      vaultState.nextAttemptAt = 0;
+      vs.consecutiveFailures = 0;
+      vs.nextAttemptAt = 0;
       return;
     }
 
-    console.log(`[${watched.label}] compoundFees due`);
-    const receipt = await sendManagedTx(vault.connect(signer), 'compoundFees', signer);
-    if (receipt?.status !== 1n) {
-      throw new Error('compoundFees transaction reverted');
-    }
-    vaultState.totalCompounds += 1;
-    vaultState.lastCompoundAt = Date.now();
-    vaultState.consecutiveFailures = 0;
-    vaultState.nextAttemptAt = 0;
+    logInfo(watched.label, 'compoundFees due');
+    const receipt = await sendManagedTx(vault.connect(rt.signer), 'compoundFees', rt.signer, watched.label);
+    if (receipt?.status !== 1n) throw new Error('compoundFees transaction reverted');
+    vs.totalCompounds += 1;
+    vs.lastCompoundAt = Date.now();
+    vs.consecutiveFailures = 0;
+    vs.nextAttemptAt = 0;
   } catch (error) {
-    vaultState.consecutiveFailures += 1;
-    const backoffMs = Math.min(POLL_MS * (2 ** Math.min(vaultState.consecutiveFailures, 6)), 5 * 60 * 1000);
-    vaultState.nextAttemptAt = Date.now() + backoffMs;
+    vs.consecutiveFailures += 1;
+    const baseBackoff = POLL_MS * (2 ** Math.min(vs.consecutiveFailures, 6));
+    vs.nextAttemptAt = Date.now() + jitter(Math.min(baseBackoff, MAX_BACKOFF_MS));
+
+    if (isNetworkError(error)) rt.networkFailures += 1;
+
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[${watched.label}] ${message}`);
+    logErr(watched.label, message);
     if (!isRetryableError(error)) {
-      console.error(`[${watched.label}] non-retryable error, keeping backoff but operator attention is required`);
+      logErr(watched.label, 'non-retryable error — backoff in place, manual attention may be required');
     }
   }
 }
 
+function createRuntime(): Runtime {
+  const provider = new ethers.JsonRpcProvider(RPC_URL);
+  const signer   = new ethers.Wallet(KEEPER_PK, provider);
+  return { provider, signer, networkFailures: 0 };
+}
+
 async function main() {
   if (!KEEPER_PK) {
-    console.error('KEEPER_PK not set');
+    logErr('boot', 'KEEPER_PK not set');
     process.exit(1);
   }
 
   const watchedVaults = configuredVaults().filter((vault) => vault.strategy);
   if (watchedVaults.length === 0) {
-    console.error('No strategy addresses configured');
+    logErr('boot', 'No strategy addresses configured');
     process.exit(1);
   }
 
-  const provider = new ethers.JsonRpcProvider(RPC_URL);
-  const signer = new ethers.Wallet(KEEPER_PK, provider);
+  let rt = createRuntime();
 
   for (const watched of watchedVaults) {
     state[watched.strategy] = {
@@ -227,31 +325,57 @@ async function main() {
     };
   }
 
-  console.log(`Keeper address: ${signer.address}`);
-  console.log(`RPC: ${RPC_URL}`);
-  console.log(`Watching ${watchedVaults.length} vaults`);
-  console.log(`Poll interval: ${POLL_MS}ms`);
-  console.log(`Compound interval: ${COMPOUND_MS}ms`);
+  logInfo('boot', `keeper=${rt.signer.address} rpc=${RPC_URL}`);
+  logInfo('boot', `watching ${watchedVaults.length} vaults; poll=${POLL_MS}ms compound=${COMPOUND_MS}ms`);
+
+  try {
+    await preflight(rt, watchedVaults);
+  } catch (err) {
+    logErr('preflight', err instanceof Error ? err.message : String(err));
+    process.exit(2);
+  }
+
+  const stop = (signal: string) => {
+    if (stopping) return;
+    stopping = true;
+    logInfo('shutdown', `received ${signal}; finishing in-flight work and exiting`);
+  };
+  process.on('SIGINT',  () => stop('SIGINT'));
+  process.on('SIGTERM', () => stop('SIGTERM'));
 
   let cycle = 0;
-  while (true) {
+  while (!stopping) {
     cycle += 1;
     if (cycle % 10 === 0) {
-      console.log(`\n[cycle ${cycle}]`);
-      for (const watched of watchedVaults) {
-        const vaultState = state[watched.strategy];
-        console.log(
-          `${watched.label} | rebalances=${vaultState.totalRebalances} | compounds=${vaultState.totalCompounds} | failures=${vaultState.consecutiveFailures}`,
-        );
-      }
+      const summary = watchedVaults
+        .map((w) => {
+          const s = state[w.strategy];
+          return `${w.label}=R${s.totalRebalances}/C${s.totalCompounds}/F${s.consecutiveFailures}`;
+        })
+        .join(' ');
+      logInfo('heartbeat', `cycle=${cycle} ${summary}`);
     }
 
-    await Promise.allSettled(watchedVaults.map((watched) => runKeeperCycle(watched, signer)));
+    await Promise.allSettled(watchedVaults.map((watched) => runKeeperCycle(rt, watched)));
+
+    // Persistent network errors → cycle the provider. We don't reset state so any
+    // in-progress backoffs continue to apply on the new connection.
+    if (rt.networkFailures >= PROVIDER_RESET_AFTER) {
+      logErr('runtime', `provider had ${rt.networkFailures} network failures; reconnecting`);
+      try {
+        rt.provider.destroy?.();
+      } catch { /* best-effort */ }
+      rt = createRuntime();
+    }
+
     await new Promise((resolve) => setTimeout(resolve, POLL_MS));
   }
+
+  logInfo('shutdown', 'goodbye');
+  process.exit(0);
 }
 
 main().catch((error) => {
-  console.error('Fatal keeper error:', error);
+  logErr('fatal', error instanceof Error ? error.message : String(error));
   process.exit(1);
 });
