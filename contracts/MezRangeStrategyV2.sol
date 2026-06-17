@@ -183,15 +183,33 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         token0.safeTransferFrom(msg.sender, address(this), amount0);
         if (amount1 > 0) token1.safeTransferFrom(msg.sender, address(this), amount1);
 
+        // Track whether we synthesised token1 from a single-sided deposit. Only
+        // in that case do we then swap-to-optimise the ratio. When the caller
+        // supplied BOTH tokens (dual deposit), we respect their ratio and perform
+        // NO swaps at all.
+        bool autoSwapped = false;
         if (amount1 == 0 && amount0 > 0) {
             uint256 swapAmt = amount0 / 2;
             amount1 = _swapToken0ForToken1(swapAmt);
+            autoSwapped = true;
         }
 
         // Align the inventory with the live range before minting the initial
         // position. This avoids first-deposit failures when a naive 50/50 split
         // cannot satisfy both min-amount constraints on concentrated liquidity.
-        _rebalanceTokenRatio(tickLower, tickUpper);
+        //
+        // CRITICAL (Mezo thin-pool fix): skip the ratio-optimising swaps when the
+        // caller already provided both tokens. Mezo testnet pools are extremely
+        // shallow (e.g. the MUSD/BTC-50 pool holds ~1.68e17 liquidity), so ANY
+        // pool.swap of a meaningful size either exhausts in-range liquidity (the
+        // swap can't fill and reverts) or executes far below the TWAP floor
+        // (`SlippageExceeded`). Forcing a ratio swap here is exactly what made
+        // every dual deposit revert on-chain. positionManager.mint() already
+        // consumes only what fits the range and leaves the remainder idle (which
+        // `totalValue()` still accounts for), so a perfect ratio is not required.
+        if (autoSwapped) {
+            _rebalanceTokenRatio(tickLower, tickUpper);
+        }
 
         amount0 = token0.balanceOf(address(this));
         amount1 = token1.balanceOf(address(this));
@@ -219,7 +237,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
                 INonfungiblePositionManager.MintParams({
                     token0:          address(token0),
                     token1:          address(token1),
-                    fee:             fee,
+                    tickSpacing:     tickSpacing,
                     tickLower:       tickLower,
                     tickUpper:       tickUpper,
                     amount0Desired:  amount0,
@@ -227,7 +245,8 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
                     amount0Min:      amount0Min,
                     amount1Min:      amount1Min,
                     recipient:       address(this),
-                    deadline:        block.timestamp + 60
+                    deadline:        block.timestamp + 60,
+                    sqrtPriceX96:    0
                 })
             );
             positionTokenId = tokenId;
@@ -728,7 +747,6 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
     ///      from this contract back to the pool.
     function _swapToken0ForToken1(uint256 amountIn) internal returns (uint256 amountOut) {
         if (amountIn == 0) return 0;
-        uint256 minOut = _calcAmountOutMin0For1(amountIn);
         _swapping = true;
         // zeroForOne = true → swap token0 for token1. sqrtPriceLimitX96 is the
         // floor price the swap may push the pool to. MIN_SQRT_RATIO + 1 means
@@ -744,15 +762,22 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         _swapping = false;
         // amount1Delta is negative when we receive token1
         amountOut = uint256(-amount1Delta);
-        require(uint256(amount0Delta) == amountIn, "Strategy: swap input mismatch");
-        if (amountOut < minOut) revert SlippageExceeded();
-        emit TokensSwappedForRebalance(amountIn, amountOut, true);
+        // Tolerate partial fills. On a thin pool the swap may exhaust in-range
+        // liquidity and consume LESS than `amountIn` before stopping. Hard-
+        // reverting on `amount0Delta != amountIn` (the old "swap input mismatch")
+        // bricked deposits on Mezo's shallow testnet pools. The unconsumed token0
+        // simply stays in the strategy and is used by the subsequent mint / kept
+        // as idle (counted by totalValue()). We still enforce the per-unit TWAP
+        // slippage floor — but against what was ACTUALLY swapped, not the request.
+        uint256 consumed = uint256(amount0Delta);
+        if (consumed == 0) revert SlippageExceeded();
+        if (amountOut < _calcAmountOutMin0For1(consumed)) revert SlippageExceeded();
+        emit TokensSwappedForRebalance(consumed, amountOut, true);
     }
 
     /// @notice Swap token1 -> token0 directly via the pool with TWAP-enforced slippage floor.
     function _swapToken1ForToken0(uint256 amountIn) internal returns (uint256 amountOut) {
         if (amountIn == 0) return 0;
-        uint256 minOut = _calcAmountOutMin1For0(amountIn);
         _swapping = true;
         (int256 amount0Delta, int256 amount1Delta) = pool.swap(
             address(this),
@@ -763,9 +788,11 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
         );
         _swapping = false;
         amountOut = uint256(-amount0Delta);
-        require(uint256(amount1Delta) == amountIn, "Strategy: swap input mismatch");
-        if (amountOut < minOut) revert SlippageExceeded();
-        emit TokensSwappedForRebalance(amountIn, amountOut, false);
+        // Tolerate partial fills (see _swapToken0ForToken1 for rationale).
+        uint256 consumed = uint256(amount1Delta);
+        if (consumed == 0) revert SlippageExceeded();
+        if (amountOut < _calcAmountOutMin1For0(consumed)) revert SlippageExceeded();
+        emit TokensSwappedForRebalance(consumed, amountOut, false);
     }
 
     /// @notice Required by IUniswapV3SwapCallback. Pays the pool the positive
@@ -881,7 +908,7 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
                 INonfungiblePositionManager.MintParams({
                     token0:         address(token0),
                     token1:         address(token1),
-                    fee:            fee,
+                    tickSpacing:    tickSpacing,
                     tickLower:      newTickLower,
                     tickUpper:      newTickUpper,
                     amount0Desired: bal0,
@@ -889,7 +916,8 @@ contract MezRangeStrategyV2 is AccessControl, ReentrancyGuard, Pausable, IERC721
                     amount0Min:     est0 * (10000 - slippageBps) / 10000,
                     amount1Min:     est1 * (10000 - slippageBps) / 10000,
                     recipient:      address(this),
-                    deadline:       block.timestamp + 60
+                    deadline:       block.timestamp + 60,
+                    sqrtPriceX96:   0
                 })
             );
 

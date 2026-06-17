@@ -125,7 +125,7 @@ contract MockPositionManager is INonfungiblePositionManager {
         view
         override
         returns (
-            uint96, address, address, address, uint24,
+            uint96, address, address, address, int24,
             int24, int24, uint128, uint256, uint256, uint128, uint128
         )
     {
@@ -133,7 +133,8 @@ contract MockPositionManager is INonfungiblePositionManager {
             0, address(0),
             posToken0[tokenId],
             posToken1[tokenId],
-            3000,
+            int24(50), // tickSpacing (CL); was uint24 fee in Uniswap V3
+
             posTickLower[tokenId],
             posTickUpper[tokenId],
             posLiquidity[tokenId],

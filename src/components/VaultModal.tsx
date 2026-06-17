@@ -76,7 +76,10 @@ export default function VaultModal({
 }: VaultModalProps) {
   const [tab, setTab] = useState<'deposit' | 'withdraw' | 'history'>('deposit');
   const [amount, setAmount] = useState('');
-  const [dualMode, setDualMode] = useState(false);
+  // Default to dual deposit: on Mezo's shallow CL pools the single-sided path must
+  // swap half the deposit through the pool, which reverts (SlippageExceeded / partial
+  // fill). Providing both tokens directly skips the swap and is the reliable path.
+  const [dualMode, setDualMode] = useState(true);
   const [amount1, setAmount1] = useState('');
 
   const vaultId = (vault?.id ?? 'vault-btc-musd') as 'vault-btc-musd' | 'vault-mezo-musd' | 'vault-btc-musd-10';
@@ -490,9 +493,12 @@ export default function VaultModal({
                 {tab === 'deposit' && isConnected && contractsDeployed && (
                   <div className="flex items-center justify-between glass rounded-xl px-4 py-3 border border-white/5">
                     <div>
-                      <div className="text-xs font-semibold text-white">Dual Deposit</div>
+                      <div className="text-xs font-semibold text-white">
+                        Dual Deposit <span className="text-emerald-400">· recommended</span>
+                      </div>
                       <div className="text-xs text-slate-500 mt-0.5">
-                        Provide {vault.token0Symbol} + {vault.token1Symbol} directly — skips internal swap
+                        Provide {vault.token0Symbol} + {vault.token1Symbol} directly — skips the internal
+                        swap. Single-sided deposits can revert on Mezo's shallow pools.
                       </div>
                     </div>
                     <button

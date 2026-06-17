@@ -54,7 +54,14 @@ export const DEPLOYED_CONTRACTS = {
       },
     },
     // Protocol infrastructure
-    positionManager: '0x9B753e11bFEd0D88F6e1D2777E3c7dac42F96062',
+    // NOTE: Mezo's DEX is a Velodrome Slipstream–style CL fork. The canonical
+    // NonfungiblePositionManager below uses CL MintParams (int24 tickSpacing +
+    // uint160 sqrtPriceX96), NOT Uniswap V3's fee-based params. The prior address
+    // (0x9B753e11…) rejected the CL ABI and caused every mint/deposit to revert.
+    // ⚠ The vault/strategy addresses above were deployed against the OLD PM and
+    //   must be re-deployed (see script/DeployTestnetDirect.s.sol) and refreshed
+    //   here before deposits will succeed on the live site.
+    positionManager: '0x509Bc221df2B83927c695FA0bb0f5B21053C874c',
     swapRouter:      '0x3112908bB72ce9c26a321Eeb22EC8e051F3b6E6a',
     keeperBot:       '0x03ffb3720214bDB0DB5F5F71b6cE16B008f762d2',
   },
