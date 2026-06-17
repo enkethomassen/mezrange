@@ -56,9 +56,18 @@ const STRATEGY_ABI = [
 
 const VAULT_ABI = [
   'function compoundFees() external',
+  'function deployIdle() external returns (uint128)',
+  'function asset() external view returns (address)',
   'function paused() external view returns (bool)',
   'function hasRole(bytes32, address) external view returns (bool)',
 ];
+
+const ERC20_ABI = [
+  'function balanceOf(address) external view returns (uint256)',
+];
+
+// Don't bother deploying dust: skip deployIdle below this idle token0 amount (1 token, 18 decimals).
+const MIN_DEPLOY_IDLE = 1n * 10n ** 18n;
 
 // Minimal pool ABI — just enough to subscribe to Swap events
 const POOL_ABI = [
@@ -143,9 +152,11 @@ function jitter(ms: number): number {
   return Math.max(POLL_MS, Math.round(ms + (Math.random() * 2 - 1) * delta));
 }
 
+type KeeperMethod = 'rebalance' | 'compoundFees' | 'deployIdle';
+
 async function buildTxRequest(
   contract: ethers.Contract,
-  method: 'rebalance' | 'compoundFees',
+  method: KeeperMethod,
   signer: ethers.Wallet,
 ): Promise<ethers.TransactionRequest> {
   const provider = signer.provider;
@@ -157,9 +168,7 @@ async function buildTxRequest(
     throw new Error(`Gas too high (${ethers.formatUnits(gasPrice, 'gwei')} gwei > ${MAX_GAS_GWEI})`);
   }
 
-  const txRequest = method === 'rebalance'
-    ? await contract.rebalance.populateTransaction()
-    : await contract.compoundFees.populateTransaction();
+  const txRequest = await contract[method].populateTransaction();
 
   const gasEstimate = await provider.estimateGas({ ...txRequest, from: signer.address });
 
@@ -175,7 +184,7 @@ async function buildTxRequest(
 
 async function sendManagedTx(
   contract: ethers.Contract,
-  method: 'rebalance' | 'compoundFees',
+  method: KeeperMethod,
   signer: ethers.Wallet,
   label: string,
 ): Promise<ethers.TransactionReceipt | null> {
@@ -241,6 +250,25 @@ async function checkAndAct(rt: Runtime, watched: WatchedVault, trigger: 'swap-ev
       vs.nextAttemptAt = 0;
       logInfo(watched.label, `rebalance #${vs.totalRebalances} confirmed in block ${receipt.blockNumber}`);
       return;
+    }
+
+    // Deploy idle deposits into the LP. User deposits are pool-free (funds held
+    // idle); the keeper pushes them into the position here. Best-effort and
+    // isolated: a revert (e.g. shallow-pool swap) must NOT trip the rebalance
+    // backoff, so it has its own try/catch and does not rethrow.
+    if (trigger === 'poll' && vault && !await vault.paused()) {
+      try {
+        const assetAddr = await vault.asset();
+        const token0 = new ethers.Contract(assetAddr, ERC20_ABI, rt.provider);
+        const idle0: bigint = await token0.balanceOf(watched.vault);
+        if (idle0 >= MIN_DEPLOY_IDLE) {
+          logInfo(watched.label, `deploying idle ${ethers.formatUnits(idle0, 18)} token0 into LP`);
+          const receipt = await sendManagedTx(vault.connect(rt.signer) as ethers.Contract, 'deployIdle', rt.signer, watched.label);
+          if (receipt?.status === 1n) logInfo(watched.label, `deployIdle confirmed in block ${receipt.blockNumber}`);
+        }
+      } catch (e) {
+        logInfo(watched.label, `deployIdle skipped: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
 
     // Only compound on poll cycles to avoid redundant hourly calls from swap events
