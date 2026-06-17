@@ -401,7 +401,7 @@ contract MezRangeVaultTest is Test {
     // 7. EDGE CASES
     // ─────────────────────────────────────────────────────────────────────────
 
-    function test_EdgeCase_DepositWhenOutOfRange() public {
+    function test_EdgeCase_DeployIdleWhenOutOfRange() public {
         _depositAndActivatePosition();
 
         // Move spot well above the current tickUpper. Keep TWAP in sync.
@@ -409,16 +409,20 @@ contract MezRangeVaultTest is Test {
         pool.setTick(newSpot);
         pool.setTickCumulatives(0, int56(newSpot) * int56(int32(300)));
 
-        // When spot is above tickUpper, getLiquidityForAmounts returns 0 for
-        // token0 (all value is token1). _rebalanceTokenRatio swaps all token0 → token1
-        // and then estLiquidity == 0 because the existing position is above range.
-        // Depositing into an out-of-range existing position reverts with ZeroLiquidity —
-        // this is correct and safe behaviour: the keeper should rebalance first.
+        // Deposits ALWAYS succeed now — funds are held idle and never touch the
+        // pool, so an out-of-range market cannot block a user deposit.
         vm.startPrank(bob);
         token0.approve(address(vault), DEPOSIT_AMOUNT);
-        vm.expectRevert(abi.encodeWithSignature("ZeroLiquidity()"));
         vault.deposit(DEPOSIT_AMOUNT, bob);
         vm.stopPrank();
+        assertGt(vault.balanceOf(bob), 0, "Out-of-range deposit should still mint shares");
+
+        // Deploying idle funds into an out-of-range position reverts with
+        // ZeroLiquidity (estLiquidity == 0). The keeper must rebalance first; the
+        // user's deposit is unaffected and their idle funds remain withdrawable.
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSignature("ZeroLiquidity()"));
+        vault.deployIdle();
     }
 
     function test_EdgeCase_TWAP_FallbackToSpot() public {
@@ -612,6 +616,9 @@ contract MezRangeVaultTest is Test {
         token0.approve(address(vault), DEPOSIT_AMOUNT);
         vault.deposit(DEPOSIT_AMOUNT, alice);
         vm.stopPrank();
+        // Deposits now leave funds idle; the keeper deploys them into the LP.
+        vm.prank(keeper);
+        vault.deployIdle();
         assertTrue(strategy.positionActive(), "Position should be active");
     }
 

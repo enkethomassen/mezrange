@@ -210,9 +210,12 @@ contract MezRangeVault is ERC20, IERC4626, AccessControl, ReentrancyGuard, Pausa
         }
 
         _mint(receiver, shares);
-        uint256 bal0 = IERC20(asset()).balanceOf(address(this));
-        IERC20(asset()).forceApprove(address(strategy), bal0);
-        strategy.addLiquidity(bal0, 0);
+        // Funds are held IDLE in the vault and deployed into the LP position by the
+        // keeper via deployIdle(). A user deposit deliberately NEVER touches the
+        // pool, so a shallow-pool swap or mint can never make a deposit revert
+        // (this was the root cause of every on-chain deposit failure on Mezo).
+        // totalAssets() already counts idle vault balances, so share pricing is
+        // correct while funds await deployment.
         emit Deposit(msg.sender, receiver, assets, shares);
     }
 
@@ -235,10 +238,32 @@ contract MezRangeVault is ERC20, IERC4626, AccessControl, ReentrancyGuard, Pausa
         }
 
         _mint(receiver, shares);
-        uint256 bal0 = IERC20(asset()).balanceOf(address(this));
-        IERC20(asset()).forceApprove(address(strategy), bal0);
-        strategy.addLiquidity(bal0, 0);
+        // Held idle; deployed by the keeper via deployIdle(). See deposit().
         emit Deposit(msg.sender, receiver, assets, shares);
+    }
+
+    /// @notice Keeper deploys idle vault assets into the strategy's LP position.
+    ///         Deposits intentionally leave funds idle so a user deposit never
+    ///         touches the pool. The keeper batches idle funds into the position
+    ///         here. To avoid swapping on shallow Mezo pools, the keeper may
+    ///         transfer token1 into the vault BEFORE calling this — both idle
+    ///         balances are forwarded and the strategy skips its internal swap
+    ///         whenever token1 > 0 (dual deployment).
+    function deployIdle()
+        external
+        nonReentrant
+        whenNotPaused
+        onlyRole(KEEPER_ROLE)
+        returns (uint128 liquidity)
+    {
+        IERC20 t0 = IERC20(asset());
+        IERC20 t1 = IERC20(address(strategy.token1()));
+        uint256 bal0 = t0.balanceOf(address(this));
+        uint256 bal1 = t1.balanceOf(address(this));
+        if (bal0 == 0 && bal1 == 0) revert ZeroAmount();
+        if (bal0 > 0) t0.forceApprove(address(strategy), bal0);
+        if (bal1 > 0) t1.forceApprove(address(strategy), bal1);
+        liquidity = strategy.addLiquidity(bal0, bal1);
     }
 
     /// @notice Withdraw assets. Deliberately NOT `whenNotPaused`: emergency
@@ -357,13 +382,11 @@ contract MezRangeVault is ERC20, IERC4626, AccessControl, ReentrancyGuard, Pausa
         _mint(msg.sender, shares);
         if (shares < minShares) revert MaxSlippageExceeded();
 
-        // Forward both balances to strategy — passing amount1 > 0 skips the internal swap.
-        uint256 bal0 = IERC20(asset()).balanceOf(address(this));
-        uint256 bal1 = IERC20(address(strategy.token1())).balanceOf(address(this));
-        if (bal0 > 0) IERC20(asset()).forceApprove(address(strategy), bal0);
-        if (bal1 > 0) IERC20(address(strategy.token1())).forceApprove(address(strategy), bal1);
-        strategy.addLiquidity(bal0, bal1);
-
+        // Both tokens are held IDLE in the vault and deployed by the keeper via
+        // deployIdle() — same pool-free deposit guarantee as deposit(). Because
+        // the keeper deploys both balances together (token1 > 0), the strategy
+        // skips its internal swap, which is the cheapest, slippage-free way to
+        // open/extend the position on Mezo's shallow pools.
         emit Deposit(msg.sender, msg.sender, totalDepositValue, shares);
     }
 

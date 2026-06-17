@@ -76,10 +76,11 @@ export default function VaultModal({
 }: VaultModalProps) {
   const [tab, setTab] = useState<'deposit' | 'withdraw' | 'history'>('deposit');
   const [amount, setAmount] = useState('');
-  // Default to dual deposit: on Mezo's shallow CL pools the single-sided path must
-  // swap half the deposit through the pool, which reverts (SlippageExceeded / partial
-  // fill). Providing both tokens directly skips the swap and is the reliable path.
-  const [dualMode, setDualMode] = useState(true);
+  // Single-sided MUSD deposit is the default and now works reliably: deposits are
+  // pool-free (funds are held idle and deployed by the keeper later), so a deposit
+  // never swaps or mints into a shallow pool. Dual deposit remains available for
+  // users who want to supply token1 directly.
+  const [dualMode, setDualMode] = useState(false);
   const [amount1, setAmount1] = useState('');
 
   const vaultId = (vault?.id ?? 'vault-btc-musd') as 'vault-btc-musd' | 'vault-mezo-musd' | 'vault-btc-musd-10';
@@ -493,12 +494,10 @@ export default function VaultModal({
                 {tab === 'deposit' && isConnected && contractsDeployed && (
                   <div className="flex items-center justify-between glass rounded-xl px-4 py-3 border border-white/5">
                     <div>
-                      <div className="text-xs font-semibold text-white">
-                        Dual Deposit <span className="text-emerald-400">· recommended</span>
-                      </div>
+                      <div className="text-xs font-semibold text-white">Dual Deposit</div>
                       <div className="text-xs text-slate-500 mt-0.5">
-                        Provide {vault.token0Symbol} + {vault.token1Symbol} directly — skips the internal
-                        swap. Single-sided deposits can revert on Mezo's shallow pools.
+                        Optional: also supply {vault.token1Symbol} so the keeper can deploy liquidity
+                        without an on-chain swap. Single-sided {vault.token0Symbol} works fine on its own.
                       </div>
                     </div>
                     <button

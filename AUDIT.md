@@ -73,7 +73,26 @@ and `totalAssets()` reverts, so it is non-functional today.
 
 ---
 
-## Fixes applied in this PR
+## The fix that makes deposits work (ported from Project B)
+
+Project B's deposits succeed because **`deposit()` never touches the pool** — it takes token0,
+mints shares, and leaves funds **idle** in the vault; the keeper deploys idle funds into the LP
+later. A user deposit therefore cannot revert on a shallow-pool swap/mint.
+
+This PR adopts the same architecture:
+
+- `MezRangeVault.deposit()` / `mint()` / `depositDual()` **no longer call `strategy.addLiquidity()`**.
+  They transfer the token(s) in, mint shares, and hold funds idle. `totalAssets()` already counts
+  idle vault balances, so share pricing stays exact.
+- New `MezRangeVault.deployIdle()` (`KEEPER_ROLE`) batches idle balances into the LP position.
+  The keeper may pre-fund token1 to skip the swap entirely (dual deployment).
+- The keeper bot calls `deployIdle()` on poll cycles (best-effort, isolated from the rebalance
+  backoff so a shallow-pool revert never stalls rebalancing).
+
+Net effect: **single-sided MUSD deposits now succeed regardless of pool depth** — the original
+"users cannot deposit" symptom is fixed at the contract level, exactly as Project B does it.
+
+## Other fixes in this PR
 
 **Contracts**
 - `interfaces/INonfungiblePositionManager.sol` — `MintParams` now uses `int24 tickSpacing`
